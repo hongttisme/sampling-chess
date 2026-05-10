@@ -68,27 +68,42 @@ def load_dataset(path: Path) -> dict:
 
 
 def load_dataset_pgx(path: Path) -> dict:
-    """Plan A pipeline: pre-encode FENs through pgx and load 4672-action labels.
+    """Plan A pipeline: load a .npz produced by scripts/04_relabel_pgx.py.
+
+    The .npz is expected to already contain pre-encoded pgx observations
+    and legal masks (relabel script computes these once per labeling job;
+    pgx's _from_fen is ~30 ms/pos in JAX-traced overhead, fine once but
+    a 17-hour cold-start penalty at 2M positions if done on every load).
 
     Returns a dict with numpy arrays:
       observation  (N, 8, 8, 119) float32   pgx state.observation
-      masks        (N, 4672) bool          pgx legal_action_mask
+      masks        (N, 4672) bool           pgx legal_action_mask
       target_idx   (N, k) int32             move indices in pgx 4672 space
       target_prob  (N, k) float32           soft policy targets (padded 0)
       target_value (N,) float32             scalar value target
 
-    pgx state init via _from_fen runs ~1.5 ms/pos because of the JAX-traced
-    legal-mask computation. For 50k positions this is ~75 s; we cache the
-    encoded tensors in memory after this single pass. For 2M, swap for a
-    streaming loader.
+    Falls back to per-position pgx encoding if the .npz lacks observation
+    + masks (older data files); slow, emits a warning.
     """
+    raw = np.load(path)
+
+    if "observation" in raw.files and "masks" in raw.files:
+        return {
+            "observation": raw["observation"].astype(np.float32),
+            "masks": raw["masks"].astype(bool),
+            "target_idx": raw["move_indices"].astype(np.int32),
+            "target_prob": raw["move_probs"].astype(np.float32),
+            "target_value": raw["value_targets"].astype(np.float32),
+        }
+
+    print("[warn] dataset lacks pre-encoded observation/masks; "
+          "falling back to per-position pgx_from_fen (slow). "
+          "Re-run scripts/04_relabel_pgx.py to refresh.")
     from sampling_chess.pgx_bridge import chess_board_to_pgx_state
     from sampling_chess.net import PGX_NUM_ACTIONS, PGX_OBSERVATION_CHANNELS
 
-    raw = np.load(path)
     fens = raw["fens"]
     n = len(fens)
-
     obs = np.zeros((n, 8, 8, PGX_OBSERVATION_CHANNELS), dtype=np.float32)
     masks = np.zeros((n, PGX_NUM_ACTIONS), dtype=bool)
     for i, fen in enumerate(fens):

@@ -1,13 +1,18 @@
 """Encoder-only chess transformer with policy + value heads (Flax linen).
 
-Architecture (per doc 4.1):
-  Input  : 8x8 board -> 64 piece tokens (Embed of 13 categories)
-           + 1 global token (Dense from 9 global features)
-           + learned 2D positional embed for the 64 board tokens
-  Encoder: 8 transformer blocks, d_model=384, 6 heads, FFN dim 1536,
-           pre-RMSNorm, GELU. Roughly 7-8M params.
-  Heads  : policy = Dense(NUM_ACTIONS) on mean-pooled features
-           value  = 2-layer MLP -> tanh in [-1, 1]
+Two variants share TransformerBlock + heads:
+
+  * ChessTransformer (legacy): doc 4.1 spec. Inputs are our (pieces (8,8)
+    int8 + globals (9,) float32); output policy is over our 4288-action
+    space. Used by Phase 1 SL training before we adopted pgx.
+
+  * ChessTransformerPgx (Plan A): pgx-native. Inputs are pgx observation
+    (8, 8, 119) float32; output policy is over pgx's 4672 actions
+    (AlphaZero standard). Used by Phase 2 / mctx integration.
+
+Both: 8 layers, d_model=384, 6 heads, FFN 1536, RMSNorm + GELU. Param
+counts diverge slightly (pgx variant has a larger input projection but
+a slightly different action-head size).
 
 The forward pass is JIT-friendly; mask out illegal logits at inference
 via apply_legal_mask before sampling/argmax.
@@ -131,3 +136,69 @@ def apply_legal_mask(logits: jnp.ndarray, mask: jnp.ndarray,
 def count_params(params) -> int:
     """Sum of leaf array sizes in a Flax param tree."""
     return sum(p.size for p in jax.tree_util.tree_leaves(params))
+
+
+# ---------------------------------------------------------------------------
+# Pgx-native variant (Plan A)
+# ---------------------------------------------------------------------------
+#
+# pgx Chess emits a (8, 8, 119) observation per state and uses a 4672-action
+# space. The 119 channels encode 8 plies of board history (own + opponent
+# pieces, repetition counts) plus side-to-move, castling rights, half-move
+# clock, etc., in current-player POV. The variant below consumes this
+# tensor directly and routes it through the same TransformerBlock stack.
+
+PGX_NUM_ACTIONS = 4672
+PGX_OBSERVATION_CHANNELS = 119
+
+
+class ChessTransformerPgx(nn.Module):
+    n_layers: int = 8
+    d_model: int = 384
+    n_heads: int = 6
+    ffn_dim: int = 1536
+    n_actions: int = PGX_NUM_ACTIONS
+    obs_channels: int = PGX_OBSERVATION_CHANNELS
+
+    @nn.compact
+    def __call__(self, observation: jnp.ndarray
+                 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Args:
+          observation: (B, 8, 8, 119) float32 — pgx's per-state observation
+
+        Returns:
+          policy_logits: (B, n_actions) float32   (mask externally)
+          value:         (B,) float32 in [-1, 1]
+        """
+        B = observation.shape[0]
+
+        # Per-square projection: 119 -> d_model
+        x = observation.reshape(B, 64, self.obs_channels)
+        x = nn.Dense(self.d_model, name="input_proj")(x)  # (B, 64, d_model)
+
+        # Learned 2D positional embedding (separable rank + file).
+        rank_embed = self.param(
+            "rank_embed", nn.initializers.normal(0.02), (8, self.d_model))
+        file_embed = self.param(
+            "file_embed", nn.initializers.normal(0.02), (8, self.d_model))
+        pos = (rank_embed[:, None, :] + file_embed[None, :, :]).reshape(
+            64, self.d_model)
+        x = x + pos[None]
+
+        # Transformer encoder.
+        for _ in range(self.n_layers):
+            x = TransformerBlock(self.d_model, self.n_heads, self.ffn_dim)(x)
+        x = nn.RMSNorm()(x)
+
+        # Mean-pool over board tokens.
+        pooled = x.mean(axis=1)
+
+        policy_logits = nn.Dense(self.n_actions, name="policy_head")(pooled)
+
+        h = nn.Dense(self.d_model, name="value_hidden")(pooled)
+        h = nn.gelu(h)
+        value = nn.Dense(1, name="value_out")(h)[..., 0]
+        value = jnp.tanh(value)
+
+        return policy_logits, value

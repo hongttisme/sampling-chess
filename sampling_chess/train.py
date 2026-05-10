@@ -31,18 +31,18 @@ from sampling_chess import board as B
 # ---------------------------------------------------------------------------
 
 def load_dataset(path: Path) -> dict:
-    """Load .npz produced by scripts/02_label_batch.py + pre-encode boards.
+    """Load .npz produced by scripts/02_label_batch.py + pre-encode boards
+    using OUR (pieces, globals, masks) encoding.
 
     Returns a dict with numpy arrays:
       pieces       (N, 8, 8) int8     piece-plane encoding
       globals      (N, 9) float32     global features
-      masks        (N, NUM_ACTIONS) bool   legal-move mask
-      target_idx   (N, k) int32       move indices (padded -1)
+      masks        (N, NUM_ACTIONS) bool   legal-move mask (4288)
+      target_idx   (N, k) int32       move indices in our 4288 space (padded -1)
       target_prob  (N, k) float32     soft policy targets (padded 0)
       target_value (N,) float32       scalar value target
 
-    The board-encoding pass is single-threaded; ~50 µs/position. For 50k
-    positions this is ~2.5s. For 2M, swap this for a streaming dataloader.
+    Use load_dataset_pgx for pgx-encoded data (Plan A pipeline).
     """
     raw = np.load(path)
     fens = raw["fens"]
@@ -60,6 +60,45 @@ def load_dataset(path: Path) -> dict:
     return {
         "pieces": pieces,
         "globals": globals_,
+        "masks": masks,
+        "target_idx": raw["move_indices"].astype(np.int32),
+        "target_prob": raw["move_probs"].astype(np.float32),
+        "target_value": raw["value_targets"].astype(np.float32),
+    }
+
+
+def load_dataset_pgx(path: Path) -> dict:
+    """Plan A pipeline: pre-encode FENs through pgx and load 4672-action labels.
+
+    Returns a dict with numpy arrays:
+      observation  (N, 8, 8, 119) float32   pgx state.observation
+      masks        (N, 4672) bool          pgx legal_action_mask
+      target_idx   (N, k) int32             move indices in pgx 4672 space
+      target_prob  (N, k) float32           soft policy targets (padded 0)
+      target_value (N,) float32             scalar value target
+
+    pgx state init via _from_fen runs ~1.5 ms/pos because of the JAX-traced
+    legal-mask computation. For 50k positions this is ~75 s; we cache the
+    encoded tensors in memory after this single pass. For 2M, swap for a
+    streaming loader.
+    """
+    from sampling_chess.pgx_bridge import chess_board_to_pgx_state
+    from sampling_chess.net import PGX_NUM_ACTIONS, PGX_OBSERVATION_CHANNELS
+
+    raw = np.load(path)
+    fens = raw["fens"]
+    n = len(fens)
+
+    obs = np.zeros((n, 8, 8, PGX_OBSERVATION_CHANNELS), dtype=np.float32)
+    masks = np.zeros((n, PGX_NUM_ACTIONS), dtype=bool)
+    for i, fen in enumerate(fens):
+        bd = chess.Board(str(fen))
+        state = chess_board_to_pgx_state(bd)
+        obs[i] = np.asarray(state.observation, dtype=np.float32)
+        masks[i] = np.asarray(state.legal_action_mask, dtype=bool)
+
+    return {
+        "observation": obs,
         "masks": masks,
         "target_idx": raw["move_indices"].astype(np.int32),
         "target_prob": raw["move_probs"].astype(np.float32),
@@ -111,7 +150,7 @@ def value_loss_fn(pred_v: jnp.ndarray, target_v: jnp.ndarray) -> jnp.ndarray:
 
 
 def make_train_step(model, lambda_v: float = 1.0):
-    """Build a JIT'd train_step(state, batch) -> (state, metrics)."""
+    """Build a JIT'd train_step for the legacy (pieces, globals) net."""
 
     def loss_fn(params, batch):
         logits, value = model.apply(
@@ -119,6 +158,34 @@ def make_train_step(model, lambda_v: float = 1.0):
             batch["pieces"].astype(jnp.int32),
             batch["globals"],
         )
+        p_loss = policy_loss_fn(logits, batch["masks"],
+                                batch["target_idx"], batch["target_prob"])
+        v_loss = value_loss_fn(value, batch["target_value"])
+        loss = p_loss + lambda_v * v_loss
+        return loss, (p_loss, v_loss)
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+
+    @jax.jit
+    def train_step(state, batch):
+        (loss, (p_loss, v_loss)), grads = grad_fn(state.params, batch)
+        state = state.apply_gradients(grads=grads)
+        gn = optax.tree.norm(grads)
+        return state, {
+            "loss": loss,
+            "policy_loss": p_loss,
+            "value_loss": v_loss,
+            "grad_norm": gn,
+        }
+
+    return train_step
+
+
+def make_train_step_pgx(model, lambda_v: float = 1.0):
+    """Plan A: train_step factory for ChessTransformerPgx (single observation arg)."""
+
+    def loss_fn(params, batch):
+        logits, value = model.apply({"params": params}, batch["observation"])
         p_loss = policy_loss_fn(logits, batch["masks"],
                                 batch["target_idx"], batch["target_prob"])
         v_loss = value_loss_fn(value, batch["target_value"])

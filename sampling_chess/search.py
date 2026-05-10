@@ -1,123 +1,196 @@
-"""Arm A: MCTS via DeepMind mctx + pgx Chess.
+"""Arm A: MCTS via DeepMind mctx + pgx Chess (Plan A).
 
-==========================================================================
-SCAFFOLD STATE: Bridge utilities + architectural decision documented;
-                actual mctx wiring deferred pending design decision.
-==========================================================================
+Now that net.py + pgx_bridge are pgx-native, the recurrent_fn is JAX-pure
+end-to-end:
 
-Doc 6.1 instruction: "use mctx; do not write your own MCTS." Three concrete
-integration paths exist. They differ in (a) what's JAX-pure inside mctx's
-JIT'd recurrent_fn, (b) how state encodes for the network, and (c) how
-much existing code (board.py, net.py, labeled .npz, sampling.py) is reused.
+  embedding = pgx State   (chess board, legal mask, observation, ...)
+  step      = pgx env.step(state, action, rng_key)
+  prior + V = net.apply({"params": ...}, state.observation[None])
 
-----------------------------------------------------------------------
-Plan A — pgx-native: adopt pgx's encoding throughout.
-----------------------------------------------------------------------
-  Net input  : pgx observation (8, 8, 119) instead of our (8x8 int8 +
-               9-dim global).
-  Action     : pgx 4672 instead of our 4288.
-  Recurrent  : trivial (already JAX-pure since pgx is JAX-native).
-  Cost       : net.py needs a new input layer + new action head; the 50k
-               labeled positions still load via FEN, but their move
-               indices live in our 4288 action space and need a one-time
-               conversion to pgx's 4672 (or just discard policy targets
-               and keep value targets only). Effectively redo Phase 1.
-  Pro        : Cleanest mctx integration. mctx + pgx examples in the
-               wild use exactly this stack.
-  Con        : Throws away the work that wired up our action encoding,
-               legal_action_mask, and labeled policy targets.
+Two-player handling:
+  * `discount = -1` per step so each ply flips value sign back to the
+    parent's POV (standard mctx 2-player convention).
+  * Terminal nodes: discount = 0, reward carries the +/- 1 (or 0 draw)
+    for the player who just moved.
 
-----------------------------------------------------------------------
-Plan B — JAX-pure converters: keep our encoding, write JAX bridges.
-----------------------------------------------------------------------
-  Net input  : our (pieces (8,8) int8, globals (9,)) — unchanged.
-  Action     : our 4288 — unchanged.
-  Recurrent  : extracts our (pieces, globals) from pgx_state._x; maps
-               action 4288 <-> 4672. Both must be JAX-pure to live
-               inside the JIT'd recurrent_fn.
-  Cost       : ~3-5h of careful JAX-pure code.
-                * pgx stores _x.board in CURRENT-PLAYER POV (color=0
-                  unmodified, color=1 negate values + flip ranks). A
-                  JAX-pure converter must conditionally apply this flip.
-                * Action space mapping: pgx's 4672 = 64 squares x 73
-                  planes (AlphaZero); our 4288 = 4096 from-to + 192
-                  promo channels. The (from, to, promo) -> pgx_idx
-                  function and inverse are tedious but pure-numpy/JAX.
-  Pro        : Reuses Phase 1 SL data + net + sampling.py without
-               touching them.
-  Con        : Most engineering work; brittle if pgx changes its
-               internal POV convention.
-
-----------------------------------------------------------------------
-Plan D — host-callback: keep our encoding, run transitions in Python.
-----------------------------------------------------------------------
-  Net input  : our encoding.
-  Action     : our 4288.
-  Recurrent  : uses jax.experimental.io_callback inside recurrent_fn to
-               call python-chess.Board.push() and our board.py encoders.
-  Cost       : ~1-2h. No JAX-pure converters needed.
-  Pro        : Fastest path to a working Arm A; reuses everything.
-  Con        : Defeats mctx's vmap+JIT speedup. Per-rollout cost is
-               Python-loop bound, so wall-clock is ~5-20x mctx's native
-               speed. Phase 2 budget tightens accordingly. Also adds
-               a tracing-vs-runtime gotcha (io_callback runs only at
-               actual call time, not during JIT trace).
-
-----------------------------------------------------------------------
-Recommendation (to decide with fresh head, not at midnight):
-  * For a credible MCTS baseline at the doc's promised throughput,
-    Plan A is correct. Phase 1 redo cost is ~half day and we already
-    have all the labeling/training infrastructure to repeat it.
-  * For prototype-only "does the comparison even make sense", Plan D
-    is fastest and reuses everything.
-  * Plan B is the worst trade: most work, brittlest code, no clear
-    long-term win over A.
-
-Until that decision is made, this module exposes the bridge utilities
-needed by all three plans (via pgx_bridge.py) and a typed stub class
-for the eventual MCTS operator. Do not import from this module in
-self-play / eval until a plan is chosen.
+Returned from MctsArmA.improve_at:
+  * pi_improved : softmax-normalized visit-count distribution over the
+                  4672 pgx action space.
+  * v_plus      : scalar root value estimate from search.
+  * visit_counts: per-action visit counts (int32).
 """
 
 from dataclasses import dataclass
 from typing import Optional
 
 import chess
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 from sampling_chess import pgx_bridge
 
+try:
+    import mctx
+    import pgx as _pgx
+    _MCTX_AVAILABLE = True
+except ImportError:
+    mctx = None  # type: ignore
+    _pgx = None  # type: ignore
+    _MCTX_AVAILABLE = False
+
 
 @dataclass
 class MctsResult:
-    """Output of one MCTS search, parallel to sampling.SamplingResult."""
-    pi_improved: np.ndarray  # (NUM_ACTIONS,) float32, sums to 1 over legal moves
-    v_plus: float            # value bootstrap from search tree
-    visit_counts: np.ndarray  # (NUM_ACTIONS,) int32, visits per action
+    pi_improved: np.ndarray   # (PGX_NUM_ACTIONS,) float32, sums to 1 over legal moves
+    v_plus: float             # value bootstrap from search
+    visit_counts: np.ndarray  # (PGX_NUM_ACTIONS,) int32, visits per action
 
 
 class MctsArmA:
-    """Stubbed MCTS arm; wiring depends on plan A/B/D selection."""
+    """MCTS policy improvement via mctx.muzero_policy on a pgx Chess env.
 
-    def __init__(self, num_simulations: int = 100, c_puct: float = 1.5,
-                 dirichlet_alpha: float = 0.3, dirichlet_eps: float = 0.25):
-        self.num_simulations = num_simulations
-        self.c_puct = c_puct
-        self.dirichlet_alpha = dirichlet_alpha
-        self.dirichlet_eps = dirichlet_eps
+    Constructor takes a Flax model + params; net is expected to map a
+    pgx observation (B, 8, 8, 119) to (policy_logits (B, 4672), value (B,))
+    where value is in side-to-move POV.
+    """
+
+    def __init__(
+        self,
+        model,
+        params,
+        num_simulations: int = 100,
+        c_puct_init: float = 1.25,
+        c_puct_base: float = 19652.0,
+        dirichlet_alpha: float = 0.3,
+        dirichlet_fraction: float = 0.25,
+        rng_seed: int = 0,
+    ):
+        if not _MCTX_AVAILABLE:
+            raise ImportError("mctx and pgx are required for MctsArmA")
         if not pgx_bridge.is_available():
-            raise ImportError(
-                "MctsArmA requires pgx; install with `pip install pgx`."
+            raise ImportError("pgx_bridge / pgx not available")
+
+        self.model = model
+        self.params = params
+        self.num_simulations = num_simulations
+        self.c_puct_init = c_puct_init
+        self.c_puct_base = c_puct_base
+        self.dirichlet_alpha = dirichlet_alpha
+        self.dirichlet_fraction = dirichlet_fraction
+        self._rng = jax.random.key(rng_seed)
+        self._env = _pgx.make("chess")
+
+        # Vectorize env.step over the batch dim (size 1 for now, but the API
+        # is batched throughout).
+        self._step_v = jax.vmap(self._env.step, in_axes=(0, 0, 0))
+
+        # JIT-compiled root + recurrent fns.
+        self._root_fn = jax.jit(self._build_root_fn())
+        self._recurrent_fn = self._build_recurrent_fn()
+        self._policy_fn = jax.jit(self._build_policy_fn())
+
+    # ----- Root + recurrent functions -----
+
+    def _build_root_fn(self):
+        model = self.model
+        def root_fn(params, state):
+            obs = state.observation[None]  # (1, 8, 8, 119)
+            logits, value = model.apply({"params": params}, obs)
+            return mctx.RootFnOutput(
+                prior_logits=logits,
+                value=value,
+                embedding=jax.tree_util.tree_map(lambda x: x[None], state),
+            )
+        return root_fn
+
+    def _build_recurrent_fn(self):
+        model = self.model
+        step_v = self._step_v
+
+        def recurrent_fn(params, rng_key, action, embedding):
+            # action: (B,), embedding: pgx state batched over leading dim B
+            keys = jax.random.split(rng_key, action.shape[0])
+            new_state = step_v(embedding, action, keys)
+            logits, value = model.apply({"params": params}, new_state.observation)
+
+            # Reward from the POV of the player who JUST moved (= player whose
+            # turn it WAS before this action). pgx assigns rewards[i] to
+            # player i; we pick the player who acted by inverting the new
+            # current_player on every step (single-player swap).
+            # In pgx 2-player chess, current_player flips between {0, 1}.
+            actor = 1 - new_state.current_player  # (B,)
+            rewards = new_state.rewards            # (B, 2)
+            reward = jnp.take_along_axis(rewards, actor[:, None], axis=1)[:, 0]
+
+            # Discount: 0 at terminal (cuts off bootstrap), -1 otherwise
+            # to invert child value back to parent's POV.
+            discount = jnp.where(new_state.terminated, 0.0, -1.0)
+
+            # Mask illegal logits at the new node (mctx prefers very negative
+            # logits for invalid actions; we also pass invalid_actions).
+            logits = jnp.where(new_state.legal_action_mask, logits, -1e9)
+
+            output = mctx.RecurrentFnOutput(
+                reward=reward,
+                discount=discount,
+                prior_logits=logits,
+                value=value,
+            )
+            return output, new_state
+
+        return recurrent_fn
+
+    def _build_policy_fn(self):
+        recurrent_fn = self._recurrent_fn
+        num_simulations = self.num_simulations
+        c_puct_init = self.c_puct_init
+        c_puct_base = self.c_puct_base
+        dirichlet_alpha = self.dirichlet_alpha
+        dirichlet_fraction = self.dirichlet_fraction
+
+        def policy_fn(params, rng_key, root, invalid_actions):
+            return mctx.muzero_policy(
+                params=params,
+                rng_key=rng_key,
+                root=root,
+                recurrent_fn=recurrent_fn,
+                num_simulations=num_simulations,
+                invalid_actions=invalid_actions,
+                pb_c_init=c_puct_init,
+                pb_c_base=c_puct_base,
+                dirichlet_alpha=dirichlet_alpha,
+                dirichlet_fraction=dirichlet_fraction,
             )
 
-    def improve_at(self, board: chess.Board, *, params: Optional[dict] = None) -> MctsResult:
-        """Run num_simulations MCTS sims at `board`, return improved policy.
+        return policy_fn
 
-        Not implemented yet. See the module docstring for the architectural
-        decision blocking this method.
-        """
-        raise NotImplementedError(
-            "MctsArmA.improve_at: choose Plan A / B / D in the module "
-            "docstring before implementing. Bridge utilities are ready in "
-            "sampling_chess.pgx_bridge."
+    # ----- Public API -----
+
+    def improve_at(self, board: chess.Board) -> MctsResult:
+        """Run num_simulations MCTS sims at `board`, return improved policy."""
+        state = pgx_bridge.chess_board_to_pgx_state(board)
+
+        root = self._root_fn(self.params, state)
+
+        # invalid_actions has the same shape as prior_logits (batch, num_actions)
+        invalid_actions = ~state.legal_action_mask[None]
+
+        self._rng, subkey = jax.random.split(self._rng)
+        out = self._policy_fn(self.params, subkey, root, invalid_actions)
+
+        # action_weights is the policy-improvement target (visit-count weighted)
+        weights = np.asarray(out.action_weights[0], dtype=np.float32)
+        visits = (weights * self.num_simulations).astype(np.int32)
+        # Approximate root value: weighted avg of immediate child values.
+        # mctx returns search_tree.summary().value at root via .search_tree.
+        try:
+            v_plus = float(out.search_tree.summary().value[0])
+        except Exception:
+            v_plus = 0.0
+
+        return MctsResult(
+            pi_improved=weights,
+            v_plus=v_plus,
+            visit_counts=visits,
         )

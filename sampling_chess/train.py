@@ -149,7 +149,12 @@ def make_train_step(model, lambda_v: float = 1.0):
 def make_optimizer(lr: float = 3e-4, weight_decay: float = 0.01,
                    warmup_steps: int = 1000, total_steps: int = 50_000,
                    end_value_frac: float = 0.1) -> optax.GradientTransformation:
-    """AdamW with warmup + cosine decay, per doc 4.2."""
+    """AdamW with warmup + cosine decay, per doc 4.2.
+
+    Clamps warmup_steps to total_steps // 2 so smoke runs with --steps 30
+    don't hit a negative cosine-decay length.
+    """
+    warmup_steps = min(warmup_steps, max(1, total_steps // 2))
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=lr,

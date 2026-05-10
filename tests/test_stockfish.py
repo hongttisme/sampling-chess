@@ -107,3 +107,33 @@ def test_opponent_full_short_game():
             board.push(mv)
     # Either game ended naturally or we hit the 40-ply cap; both fine.
     assert board.fullmove_number >= 1
+
+
+# ---------- multiprocess pool ----------
+
+@no_stockfish
+def test_pool_label_batch():
+    boards = [chess.Board()] * 4
+    with SF.StockfishPool(n_workers=2, depth=6, multipv=3) as pool:
+        results = pool.label_batch(boards)
+    assert len(results) == 4
+    for out in results:
+        assert isinstance(out, SF.LabeledPosition)
+        assert 1 <= len(out.move_indices) <= 3
+        assert out.move_probs.sum() == pytest.approx(1.0, abs=1e-5)
+
+
+@no_stockfish
+def test_pool_streaming():
+    boards = [chess.Board()] * 4
+    with SF.StockfishPool(n_workers=2, depth=6, multipv=2) as pool:
+        results = list(pool.label_batch_iter(boards))
+    assert len(results) == 4
+    for out in results:
+        assert isinstance(out, SF.LabeledPosition)
+
+
+@no_stockfish
+def test_pool_invalid_n_workers():
+    with pytest.raises(ValueError):
+        SF.StockfishPool(n_workers=0)

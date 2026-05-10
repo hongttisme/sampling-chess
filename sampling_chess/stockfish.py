@@ -16,7 +16,10 @@ for the 2M-position labeling job is added in Phase 1 if needed.
 """
 
 import math
+import multiprocessing as mp
+import os
 import shutil
+import time
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -192,3 +195,147 @@ class StockfishOpponent:
         if result.move is None:
             raise RuntimeError(f"Stockfish returned no move at FEN: {board.fen()}")
         return result.move
+
+
+# ---------------------------------------------------------------------------
+# Multiprocess pool labeler
+# ---------------------------------------------------------------------------
+#
+# Each worker process holds a single long-lived StockfishLabeler. Boards are
+# passed to workers as FEN strings (chess.Board pickles fine but FEN is the
+# canonical wire format). Per the doc Phase 1 budget, this is what runs the
+# 2M-position labeling job on free CPU before any Colab work begins.
+# ---------------------------------------------------------------------------
+
+_worker_labeler: Optional["StockfishLabeler"] = None
+
+
+def _init_worker(path: Optional[str], depth: int, multipv: int,
+                 threads: int, hash_mb: int) -> None:
+    global _worker_labeler
+    _worker_labeler = StockfishLabeler(
+        path=path, depth=depth, multipv=multipv,
+        threads=threads, hash_mb=hash_mb,
+    )
+    # SIGTERM handler: graceful close of stockfish before the worker exits.
+    # atexit doesn't fire reliably when Pool.terminate() reaps spawn workers,
+    # and chess.engine's asyncio subprocess can deadlock if we leave it open.
+    import signal
+
+    def _on_sigterm(signum, frame):
+        try:
+            if _worker_labeler is not None:
+                _worker_labeler.close()
+        finally:
+            os._exit(0)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
+
+def _label_one_fen(fen: str) -> "LabeledPosition":
+    assert _worker_labeler is not None, "worker labeler not initialized"
+    return _worker_labeler.label(chess.Board(fen))
+
+
+class StockfishPool:
+    """Parallel Stockfish labeling via multiprocessing.
+
+    Spawns `n_workers` processes; each holds one Stockfish engine for the
+    pool's lifetime. Use as a context manager to guarantee clean shutdown.
+
+    Shutdown uses Pool.terminate() rather than close()+join(): chess.engine
+    runs an internal asyncio loop that can deadlock during graceful shutdown
+    when invoked from a spawn worker. terminate() sends SIGTERM, which our
+    worker handler turns into a Stockfish.close() + os._exit().
+    """
+
+    def __init__(
+        self,
+        n_workers: int,
+        path: Optional[str] = None,
+        depth: int = DEFAULT_LABEL_DEPTH,
+        multipv: int = DEFAULT_MULTIPV,
+        threads_per_worker: int = 1,
+        hash_mb: int = 64,
+    ):
+        if n_workers < 1:
+            raise ValueError(f"n_workers must be >= 1, got {n_workers}")
+        self.n_workers = n_workers
+        self.depth = depth
+        self.multipv = multipv
+        ctx = mp.get_context("spawn")
+        self._pool = ctx.Pool(
+            processes=n_workers,
+            initializer=_init_worker,
+            initargs=(path, depth, multipv, threads_per_worker, hash_mb),
+        )
+        self._closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._pool.terminate()
+            self._pool.join()
+        except Exception:
+            pass
+
+    def label_batch(self, boards: Iterable[chess.Board],
+                    chunksize: int = 4) -> list[LabeledPosition]:
+        fens = [b.fen() for b in boards]
+        return self._pool.map(_label_one_fen, fens, chunksize=chunksize)
+
+    def label_batch_iter(self, boards: Iterable[chess.Board],
+                         chunksize: int = 4):
+        """Streaming variant: yields LabeledPositions as workers finish them.
+
+        Useful for long jobs where you want to checkpoint progress.
+        """
+        fens = [b.fen() for b in boards]
+        return self._pool.imap_unordered(_label_one_fen, fens, chunksize=chunksize)
+
+
+def benchmark_pool(n_positions: int = 100, n_workers: int = 4,
+                   depth: int = 12, multipv: int = 5,
+                   seed: int = 0) -> dict:
+    """Time labeling N self-play random positions; return throughput stats."""
+    import random
+    rng = random.Random(seed)
+
+    # Generate positions via random self-play (each game contributes one mid-game position).
+    boards: list[chess.Board] = []
+    while len(boards) < n_positions:
+        b = chess.Board()
+        steps = rng.randint(4, 60)
+        for _ in range(steps):
+            if b.is_game_over():
+                break
+            mv = rng.choice(list(b.legal_moves))
+            b.push(mv)
+        if not b.is_game_over() and any(b.legal_moves):
+            boards.append(b)
+
+    t0 = time.time()
+    with StockfishPool(n_workers=n_workers, depth=depth, multipv=multipv) as pool:
+        results = pool.label_batch(boards)
+    dt = time.time() - t0
+
+    return {
+        "n_positions": len(results),
+        "n_workers": n_workers,
+        "depth": depth,
+        "multipv": multipv,
+        "wall_clock_sec": dt,
+        "ms_per_position": 1000 * dt / len(results),
+        "positions_per_sec": len(results) / dt,
+        # Project to 2M labeling job under the same conditions.
+        "projected_2M_hours": (2_000_000 * dt / len(results)) / 3600,
+    }

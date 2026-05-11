@@ -84,6 +84,11 @@ def main() -> int:
                         help="attention heads (default: 6 = doc-spec)")
     parser.add_argument("--ffn-dim", type=int, default=1536,
                         help="FFN hidden dim (default: 1536 = doc-spec)")
+    parser.add_argument("--temperature-threshold", type=int, default=30,
+                        help="plies sampled (tau=1) before greedy argmax kicks in. "
+                             "doc-spec is ~30. Larger threshold = more exploration "
+                             "throughout the game; too small + trained net -> "
+                             "deterministic argmax loops -> draws. (default: 30)")
     args = parser.parse_args()
 
     print(f"[init] arm={args.arm}, iters={args.iters}, "
@@ -163,7 +168,7 @@ def main() -> int:
         eval_n_games=args.eval_games,
         eval_opponent_time=0.02,
         max_plies=args.max_plies,
-        temperature_threshold=max(2, args.max_plies // 2),
+        temperature_threshold=args.temperature_threshold,
         seed=0,
         wandb_active=wandb_active,
         ckpt_dir=args.ckpt_dir,

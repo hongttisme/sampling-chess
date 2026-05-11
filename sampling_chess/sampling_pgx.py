@@ -11,12 +11,21 @@ action space so the operator is composable with the pgx + mctx stack.
   pi_sample(a | s_0) = sum_{i: a_0^(i)=a} exp(beta V_i) / sum exp(beta V_i')
   V^+(s_0)           = sum_i w_i V_i,   w_i proportional to exp(beta V_i)
 
-apply_fn signature: list[pgx.State] -> (logits (N, 4672), values (N,))
-                    where values are in side-to-move POV per pgx convention.
+Two implementations:
 
-This is a Python-loop implementation: for each ply, iterates over active
-trajectories sequentially. Sufficient for prototype + Stage 1 comparison;
-JAX-pure / vmap'd version is Phase 2 stretch work.
+  * sample_improved_policy_pgx (Python loop, model-agnostic apply_fn):
+    iterates trajectories sequentially. Easier to debug; baseline correct.
+    ~42 s/call on CPU for K=8/k=3 due to eager JAX env.step dispatch.
+
+  * sample_improved_policy_pgx_jit (vmap + lax.scan + jax.jit):
+    runs all K trajectories of k_plies steps inside a single jit'd graph.
+    Requires (model, k_plies, K) to be static at trace time. Handles
+    terminal trajectories via a captured-rewards carry, since pgx zeroes
+    .rewards on subsequent steps after the first terminal transition.
+
+apply_fn signature (Python version):
+    list[pgx.State] -> (logits (N, 4672), values (N,))
+    values are in side-to-move POV per pgx convention.
 """
 
 from dataclasses import dataclass
@@ -198,4 +207,140 @@ def sample_improved_policy_pgx(
         v_plus=v_plus,
         leaf_values=leaf_values.astype(np.float32),
         first_moves=first_moves,
+    )
+
+
+# ---------------------------------------------------------------------------
+# JIT-vectorized variant
+# ---------------------------------------------------------------------------
+
+def make_jit_sampler(model, K: int, k_plies: int, env=None):
+    """Build a jit'd K-trajectory rollout function.
+
+    K and k_plies become static at trace time. The returned `sampler` takes
+    (params, root_state, key) and returns numpy arrays usable downstream.
+
+    Returns a callable: sampler(params, root_state, key) ->
+      (first_actions (K,) int32,
+       leaf_v_stm  (K,) float32,    # V_theta at leaf, leaf-STM POV
+       leaf_player (K,) int32,
+       was_terminal (K,) bool,
+       captured_rewards (K, 2) float32)  # rewards at first terminal transition
+    Aggregation to (pi_improved, v_plus) happens outside jit.
+    """
+    if not _PGX_AVAILABLE:
+        raise ImportError("pgx not installed")
+    if env is None:
+        env = pgx.make("chess")
+    if K < 1 or k_plies < 1:
+        raise ValueError(f"K and k_plies must be >= 1; got K={K}, k_plies={k_plies}")
+
+    vmap_step = jax.vmap(env.step)
+
+    @jax.jit
+    def sampler(params, root_state, key):
+        # ---- Step 0: K first-moves sampled prior-weighted from root ----
+        logits_root, _ = model.apply(
+            {"params": params}, root_state.observation[None]
+        )
+        masked_root = jnp.where(
+            root_state.legal_action_mask, logits_root[0], -1e9
+        )
+        first_keys = jax.random.split(jax.random.fold_in(key, 0), K)
+        first_actions = jax.vmap(
+            lambda k: jax.random.categorical(k, masked_root)
+        )(first_keys)
+
+        # Replicate root state K times.
+        root_batched = jax.tree_util.tree_map(
+            lambda x: jnp.broadcast_to(x[None], (K,) + x.shape), root_state
+        )
+        step_keys_0 = jax.random.split(jax.random.fold_in(key, 1), K)
+        states = vmap_step(root_batched, first_actions, step_keys_0)
+
+        was_terminal = states.terminated
+        captured_rewards = states.rewards  # (K, 2) — valid where was_terminal
+
+        # ---- Scan steps 1..k_plies-1 ----
+        def body(carry, scan_key):
+            states, was_terminal, captured_rewards = carry
+            apply_key, step_key = jax.random.split(scan_key)
+            logits, _ = model.apply({"params": params}, states.observation)
+            masked = jnp.where(states.legal_action_mask, logits, -1e9)
+            apply_keys = jax.random.split(apply_key, K)
+            actions = jax.vmap(jax.random.categorical)(apply_keys, masked)
+            step_keys = jax.random.split(step_key, K)
+            new_states = vmap_step(states, actions, step_keys)
+            is_term_now = new_states.terminated
+            newly_terminal = is_term_now & (~was_terminal)
+            captured_rewards = jnp.where(
+                newly_terminal[:, None], new_states.rewards, captured_rewards
+            )
+            was_terminal = was_terminal | is_term_now
+            return (new_states, was_terminal, captured_rewards), None
+
+        if k_plies > 1:
+            scan_keys = jax.random.split(jax.random.fold_in(key, 2), k_plies - 1)
+            (states, was_terminal, captured_rewards), _ = jax.lax.scan(
+                body, (states, was_terminal, captured_rewards), scan_keys
+            )
+
+        # ---- Leaf V_theta ----
+        _, leaf_v_stm = model.apply({"params": params}, states.observation)
+        leaf_player = states.current_player
+
+        return (
+            first_actions.astype(jnp.int32),
+            leaf_v_stm.astype(jnp.float32),
+            leaf_player.astype(jnp.int32),
+            was_terminal,
+            captured_rewards.astype(jnp.float32),
+        )
+
+    return sampler
+
+
+def sample_improved_policy_pgx_jit(
+    root_state,
+    sampler: Callable,  # output of make_jit_sampler
+    params,
+    K: int,
+    beta: float,
+    rng_key,
+) -> SamplingResultPgx:
+    """JIT-vectorized version. K must match the value used in make_jit_sampler."""
+    first_actions_j, leaf_v_stm_j, leaf_player_j, was_terminal_j, captured_rewards_j = sampler(
+        params, root_state, rng_key
+    )
+    first_actions = np.asarray(first_actions_j)
+    leaf_v_stm = np.asarray(leaf_v_stm_j)
+    leaf_player = np.asarray(leaf_player_j)
+    was_terminal = np.asarray(was_terminal_j)
+    captured_rewards = np.asarray(captured_rewards_j)
+
+    root_player = int(root_state.current_player)
+
+    # Compose leaf values in root POV.
+    v_nonterm = np.where(
+        leaf_player == root_player, leaf_v_stm, -leaf_v_stm
+    ).astype(np.float32)
+    v_term = captured_rewards[:, root_player].astype(np.float32)
+    leaf_values = np.where(was_terminal, v_term, v_nonterm)
+
+    # SNIS aggregate.
+    z = beta * leaf_values
+    z = z - z.max()
+    w = np.exp(z)
+    w = w / w.sum()
+
+    pi_improved = np.zeros(PGX_NUM_ACTIONS, dtype=np.float32)
+    np.add.at(pi_improved, first_actions, w.astype(np.float32))
+
+    v_plus = float((w * leaf_values).sum())
+
+    return SamplingResultPgx(
+        pi_improved=pi_improved,
+        v_plus=v_plus,
+        leaf_values=leaf_values.astype(np.float32),
+        first_moves=first_actions.astype(np.int32),
     )

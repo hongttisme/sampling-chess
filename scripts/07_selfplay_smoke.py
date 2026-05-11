@@ -60,7 +60,7 @@ def main() -> int:
 
     arm_a = MctsArmA(model=model, params=params, num_simulations=8)
     arm_b_op = make_arm_b_op(
-        model, params, K=8, k_plies=3, beta=1.0, stratified=True,
+        model, params, K=8, k_plies=3, beta=1.0, stratified=False,
         rng=np.random.default_rng(0), env=env,
     )
 

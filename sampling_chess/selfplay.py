@@ -163,13 +163,44 @@ def play_self_game(
 def make_arm_b_op(model, params, *, K: int = 64, k_plies: int = 8,
                   beta: float = 1.0, stratified: bool = False,
                   rng: Optional[np.random.Generator] = None,
-                  env=None):
-    """Wrap sample_improved_policy_pgx as an ImprovementOp (state -> result)."""
-    from sampling_chess.sampling_pgx import sample_improved_policy_pgx
+                  env=None, use_jit: bool = True):
+    """Wrap sample_improved_policy_pgx as an ImprovementOp (state -> result).
+
+    Defaults to the jit-vectorized variant (~200x faster than the Python-loop
+    fallback after compile warmup). Set use_jit=False if you need the
+    stratified first-move mode, which is only implemented in the Python loop.
+    """
     if rng is None:
         rng = np.random.default_rng()
     if env is None and _PGX_AVAILABLE:
         env = pgx.make("chess")
+
+    if use_jit and stratified:
+        import warnings
+        warnings.warn(
+            "make_arm_b_op: stratified=True is not implemented in the jit "
+            "sampler; falling back to the Python-loop variant (~200x slower).",
+            stacklevel=2,
+        )
+
+    if use_jit and not stratified:
+        from sampling_chess.sampling_pgx import (
+            make_jit_sampler,
+            sample_improved_policy_pgx_jit,
+        )
+        sampler = make_jit_sampler(model, K=K, k_plies=k_plies, env=env)
+
+        def op_jit(state):
+            key = jax.random.key(int(rng.integers(2**31)))
+            return sample_improved_policy_pgx_jit(
+                root_state=state, sampler=sampler, params=params,
+                K=K, beta=beta, rng_key=key,
+            )
+
+        return op_jit
+
+    # Python-loop fallback (supports stratified).
+    from sampling_chess.sampling_pgx import sample_improved_policy_pgx
 
     def apply_fn(states):
         obs = jnp.stack([s.observation for s in states])

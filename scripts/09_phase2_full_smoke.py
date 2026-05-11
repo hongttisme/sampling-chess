@@ -50,6 +50,10 @@ def main() -> int:
     parser.add_argument("--eval-games", type=int, default=2)
     parser.add_argument("--eval-skill", type=int, default=0)
     parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--ckpt-dir", type=str, default=None,
+                        help="if set, save params per-iter; resume on next run if latest.pkl exists")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="ignore any existing checkpoint in --ckpt-dir")
     args = parser.parse_args()
 
     print(f"[init] arm={args.arm}, iters={args.iters}, "
@@ -102,6 +106,8 @@ def main() -> int:
         temperature_threshold=max(2, args.max_plies // 2),
         seed=0,
         wandb_active=wandb_active,
+        ckpt_dir=args.ckpt_dir,
+        resume=not args.no_resume,
     )
     total_t = time.time() - t0
 

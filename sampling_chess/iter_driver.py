@@ -15,7 +15,9 @@ Metrics are returned as a dict per iteration; pass `wandb_run=True` to also
 log via sampling_chess.log.
 """
 
+import pickle
 import time
+from pathlib import Path
 from typing import Callable, Optional
 
 import jax
@@ -35,6 +37,39 @@ from sampling_chess.train import (
     init_train_state,
     make_train_step_phase2,
 )
+
+
+def _save_ckpt(ckpt_dir: Path, iter_idx: int, train_state) -> Path:
+    """Pickle params + step + iter idx; safe across interpreter restarts."""
+    ckpt_dir = Path(ckpt_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    p = ckpt_dir / f"iter_{iter_idx:05d}.pkl"
+    with open(p, "wb") as f:
+        pickle.dump({
+            "iter": iter_idx,
+            "params": train_state.params,
+            "step": int(train_state.step),
+        }, f)
+    # Also write/refresh "latest.pkl" symlink-like for convenient resume.
+    latest = ckpt_dir / "latest.pkl"
+    with open(latest, "wb") as f:
+        pickle.dump({
+            "iter": iter_idx,
+            "params": train_state.params,
+            "step": int(train_state.step),
+        }, f)
+    return p
+
+
+def load_latest_ckpt(ckpt_dir):
+    """Return (iter_idx, params) or None if no ckpt found."""
+    ckpt_dir = Path(ckpt_dir)
+    latest = ckpt_dir / "latest.pkl"
+    if not latest.exists():
+        return None
+    with open(latest, "rb") as f:
+        d = pickle.load(f)
+    return d["iter"], d["params"]
 
 
 def phase2_iter(
@@ -208,16 +243,37 @@ def run_phase2(
     temperature_threshold: int = 30,
     seed: int = 0,
     wandb_active: bool = False,
+    ckpt_dir: Optional[str] = None,
+    resume: bool = True,
 ):
-    """Run N Phase 2 iterations; return final TrainState + per-iter metrics list."""
+    """Run N Phase 2 iterations; return final TrainState + per-iter metrics list.
+
+    If `ckpt_dir` is given, writes params + iter idx to ckpt_dir/iter_N.pkl
+    and ckpt_dir/latest.pkl after each iteration. If `resume=True` and
+    ckpt_dir/latest.pkl exists, the run continues from that iteration's
+    params (replay buffer is NOT persisted; it refills via self-play).
+    """
     if env is None:
         env = pgx.make("chess")
     rng = np.random.default_rng(seed)
     buffer = ReplayBuffer(capacity=buffer_capacity)
-    state = init_train_state(model, init_params, optimizer)
+
+    # Optional resume from existing checkpoint.
+    start_iter = 1
+    init_params_to_use = init_params
+    if ckpt_dir and resume:
+        cp = load_latest_ckpt(ckpt_dir)
+        if cp is not None:
+            resumed_iter, resumed_params = cp
+            start_iter = resumed_iter + 1
+            init_params_to_use = resumed_params
+            print(f"[resume] loaded ckpt at iter {resumed_iter}; "
+                  f"continuing from iter {start_iter}")
+
+    state = init_train_state(model, init_params_to_use, optimizer)
 
     history = []
-    for it in range(1, n_iterations + 1):
+    for it in range(start_iter, n_iterations + 1):
         state, m = phase2_iter(
             op_builder, model, state, buffer, rng,
             games_per_iter=games_per_iter,
@@ -238,4 +294,9 @@ def run_phase2(
             )
         _emit_log(it, m, eval_results, wandb_active)
         history.append({"iter": it, **m, "eval": eval_results})
+
+        if ckpt_dir:
+            saved = _save_ckpt(ckpt_dir, it, state)
+            print(f"[ckpt] {saved}")
+
     return state, history

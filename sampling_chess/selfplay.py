@@ -160,6 +160,37 @@ def play_self_game(
 # Operator wrappers — adapt the two arms to the ImprovementOp protocol.
 # ---------------------------------------------------------------------------
 
+def make_arm_b_op_builder(model, *, K: int = 64, k_plies: int = 8,
+                          beta: float = 1.0, env=None,
+                          rng: Optional[np.random.Generator] = None):
+    """Returns op_builder(params) -> ImprovementOp.
+
+    Builds the JIT'd sampler ONCE (via make_jit_sampler) and reuses it across
+    iterations; only `params` change between iterations. Use this in the
+    Phase 2 iteration driver so JIT cache doesn't reset every iter.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    if env is None and _PGX_AVAILABLE:
+        env = pgx.make("chess")
+    from sampling_chess.sampling_pgx import (
+        make_jit_sampler,
+        sample_improved_policy_pgx_jit,
+    )
+    sampler = make_jit_sampler(model, K=K, k_plies=k_plies, env=env)
+
+    def op_builder(params):
+        def op(state):
+            key = jax.random.key(int(rng.integers(2**31)))
+            return sample_improved_policy_pgx_jit(
+                root_state=state, sampler=sampler, params=params,
+                K=K, beta=beta, rng_key=key,
+            )
+        return op
+
+    return op_builder
+
+
 def make_arm_b_op(model, params, *, K: int = 64, k_plies: int = 8,
                   beta: float = 1.0, stratified: bool = False,
                   rng: Optional[np.random.Generator] = None,

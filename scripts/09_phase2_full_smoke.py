@@ -54,10 +54,23 @@ def main() -> int:
                         help="if set, save params per-iter; resume on next run if latest.pkl exists")
     parser.add_argument("--no-resume", action="store_true",
                         help="ignore any existing checkpoint in --ckpt-dir")
+    # Arm-specific knobs (default to doc-spec config; smoke can override).
+    parser.add_argument("--K", type=int, default=100,
+                        help="Arm B: number of trajectories per sample call")
+    parser.add_argument("--k-plies", type=int, default=10,
+                        help="Arm B: rollout depth per trajectory")
+    parser.add_argument("--beta", type=float, default=5.0,
+                        help="Arm B: SNIS sharpening parameter")
+    parser.add_argument("--num-sims", type=int, default=100,
+                        help="Arm A: mctx num_simulations per move")
     args = parser.parse_args()
 
     print(f"[init] arm={args.arm}, iters={args.iters}, "
           f"games/iter={args.games_per_iter}, train_steps/iter={args.train_steps}")
+    if args.arm == "a":
+        print(f"[arm A] num_sims={args.num_sims}")
+    else:
+        print(f"[arm B] K={args.K}, k_plies={args.k_plies}, beta={args.beta}")
     env = pgx.make("chess")
     model, params = _tiny_net()
     print(f"[model] {count_params(params):,} params (tiny)")
@@ -74,13 +87,13 @@ def main() -> int:
         )
 
     if args.arm == "a":
-        arm_a = MctsArmA(model=model, params=params, num_simulations=4)
+        arm_a = MctsArmA(model=model, params=params, num_simulations=args.num_sims)
         def op_builder(p):
             arm_a.params = p
             return arm_a.improve_at_state
     else:
         op_builder = make_arm_b_op_builder(
-            model, K=4, k_plies=2, beta=1.0,
+            model, K=args.K, k_plies=args.k_plies, beta=args.beta,
             rng=np.random.default_rng(0), env=env,
         )
 

@@ -199,14 +199,24 @@ PgxPolicyFn = Callable[[object], int]  # pgx_state -> pgx action_idx
 
 
 def make_pgx_greedy_policy(model, params) -> PgxPolicyFn:
-    """Greedy: argmax of masked logits over pgx 4672 actions."""
+    """Greedy: argmax of masked logits over pgx 4672 actions.
+
+    The inner forward + argmax is JIT-compiled and reused across calls (params
+    is closed over as a traced constant). Without JIT each call eager-dispatches
+    every transformer layer; on a 16M-param model that is ~100 ms/call and
+    eval dominates iteration wall-clock.
+    """
     import jax
     import jax.numpy as jnp
 
+    @jax.jit
+    def _policy_jit(observation, mask):
+        logits, _ = model.apply({"params": params}, observation[None])
+        masked = jnp.where(mask, logits[0], -1e9)
+        return jnp.argmax(masked).astype(jnp.int32)
+
     def policy(state) -> int:
-        logits, _ = model.apply({"params": params}, state.observation[None])
-        masked = jnp.where(state.legal_action_mask, logits[0], -1e9)
-        return int(jnp.argmax(masked))
+        return int(_policy_jit(state.observation, state.legal_action_mask))
 
     return policy
 
@@ -233,9 +243,14 @@ def play_pgx_eval_game(
     if rng is None:
         rng = random.Random()
 
+    # JIT env.step + env.init for cache hit on every move (eager dispatch is
+    # ~10-50 ms/call on the chess transition graph; jit'd is ~ms).
+    step_jit = jax.jit(env.step)
+    init_jit = jax.jit(env.init)
+
     if starting_state is None:
         key = jax.random.key(rng.randrange(2**31))
-        state = jax.jit(env.init)(key)
+        state = init_jit(key)
     else:
         state = starting_state
 
@@ -252,7 +267,7 @@ def play_pgx_eval_game(
             move = opponent.play(board)
             action_idx = chess_move_to_pgx_action(move, board.turn)
         step_key = jax.random.key(rng.randrange(2**31))
-        state = env.step(state, jnp.int32(action_idx), step_key)
+        state = step_jit(state, jnp.int32(action_idx), step_key)
 
     if not bool(state.terminated):
         return None

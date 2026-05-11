@@ -31,9 +31,15 @@ from sampling_chess.selfplay import (
 from sampling_chess.train import make_optimizer
 
 
-def _tiny_net():
+def _make_net(n_layers: int, d_model: int, n_heads: int, ffn_dim: int):
+    """Build a ChessTransformerPgx with the requested size.
+
+    Defaults at the CLI are doc-spec (n_layers=8, d_model=384, n_heads=6,
+    ffn_dim=1536 -> ~16M params). For CPU smoke pass `--n-layers 2
+    --d-model 128 --n-heads 4 --ffn-dim 256` to get a 901k-param model.
+    """
     model = ChessTransformerPgx(
-        n_layers=2, d_model=128, n_heads=4, ffn_dim=256
+        n_layers=n_layers, d_model=d_model, n_heads=n_heads, ffn_dim=ffn_dim,
     )
     dummy = jnp.zeros((1, 8, 8, 119), dtype=jnp.float32)
     params = model.init(jax.random.key(0), dummy)["params"]
@@ -68,6 +74,16 @@ def main() -> int:
                         help="Arm A: mctx num_simulations per move")
     parser.add_argument("--no-batched", action="store_true",
                         help="disable vmap-over-games self-play (slower; for debugging)")
+    # Model size knobs. Default is doc-spec (~16M params); pass tiny values
+    # for CPU smoke or to deliberately under-parameterize.
+    parser.add_argument("--n-layers", type=int, default=8,
+                        help="transformer depth (default: 8 = doc-spec)")
+    parser.add_argument("--d-model", type=int, default=384,
+                        help="model dim (default: 384 = doc-spec)")
+    parser.add_argument("--n-heads", type=int, default=6,
+                        help="attention heads (default: 6 = doc-spec)")
+    parser.add_argument("--ffn-dim", type=int, default=1536,
+                        help="FFN hidden dim (default: 1536 = doc-spec)")
     args = parser.parse_args()
 
     print(f"[init] arm={args.arm}, iters={args.iters}, "
@@ -77,8 +93,13 @@ def main() -> int:
     else:
         print(f"[arm B] K={args.K}, k_plies={args.k_plies}, beta={args.beta}")
     env = pgx.make("chess")
-    model, params = _tiny_net()
-    print(f"[model] {count_params(params):,} params (tiny)")
+    model, params = _make_net(
+        n_layers=args.n_layers, d_model=args.d_model,
+        n_heads=args.n_heads, ffn_dim=args.ffn_dim,
+    )
+    print(f"[model] {count_params(params):,} params  "
+          f"(n_layers={args.n_layers}, d_model={args.d_model}, "
+          f"n_heads={args.n_heads}, ffn_dim={args.ffn_dim})")
 
     wandb_active = False
     if args.wandb:

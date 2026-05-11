@@ -167,23 +167,20 @@ class MctsArmA:
 
     # ----- Public API -----
 
-    def improve_at(self, board: chess.Board) -> MctsResult:
-        """Run num_simulations MCTS sims at `board`, return improved policy."""
-        state = pgx_bridge.chess_board_to_pgx_state(board)
+    def improve_at_state(self, state) -> MctsResult:
+        """Run num_simulations MCTS sims at a pgx State, return improved policy.
 
+        Self-play loop should call this directly to avoid the slow
+        chess_board_to_pgx_state conversion when state is already in pgx form.
+        """
         root = self._root_fn(self.params, state)
-
-        # invalid_actions has the same shape as prior_logits (batch, num_actions)
         invalid_actions = ~state.legal_action_mask[None]
 
         self._rng, subkey = jax.random.split(self._rng)
         out = self._policy_fn(self.params, subkey, root, invalid_actions)
 
-        # action_weights is the policy-improvement target (visit-count weighted)
         weights = np.asarray(out.action_weights[0], dtype=np.float32)
         visits = (weights * self.num_simulations).astype(np.int32)
-        # Approximate root value: weighted avg of immediate child values.
-        # mctx returns search_tree.summary().value at root via .search_tree.
         try:
             v_plus = float(out.search_tree.summary().value[0])
         except Exception:
@@ -194,3 +191,8 @@ class MctsArmA:
             v_plus=v_plus,
             visit_counts=visits,
         )
+
+    def improve_at(self, board: chess.Board) -> MctsResult:
+        """chess.Board entry point; goes through the (slow) FEN bridge."""
+        state = pgx_bridge.chess_board_to_pgx_state(board)
+        return self.improve_at_state(state)

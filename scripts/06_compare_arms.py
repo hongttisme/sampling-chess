@@ -79,10 +79,10 @@ def main() -> int:
         )
 
         _print_top5("Arm A", a_out.pi_improved, mask, bd.turn)
-        _print_top5("Arm B", b_out.pi_sample, mask, bd.turn)
+        _print_top5("Arm B", b_out.pi_improved, mask, bd.turn)
         print(f"  v_plus:  A={a_out.v_plus:+.3f}   B={b_out.v_plus:+.3f}")
         print(f"  Arm A visit_counts.sum() = {int(a_out.visit_counts.sum())}")
-        print(f"  Arm B legal-mass = {float(b_out.pi_sample[mask].sum()):.4f}")
+        print(f"  Arm B legal-mass = {float(b_out.pi_improved[mask].sum()):.4f}")
 
     print("\n[done] both arms produced valid distributions on legal first moves")
     return 0

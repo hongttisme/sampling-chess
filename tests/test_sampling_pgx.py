@@ -49,25 +49,25 @@ def test_uniform_pi_uniform_v_uniform_target_stratified():
         K=K, k_plies=4, beta=1.0, rng=rng, stratified=True, env=_ENV,
     )
     expected = 1.0 / n_legal
-    on_legal = out.pi_sample[legal]
+    on_legal = out.pi_improved[legal]
     np.testing.assert_allclose(on_legal, expected, atol=1e-6)
-    illegal_mass = out.pi_sample.sum() - on_legal.sum()
+    illegal_mass = out.pi_improved.sum() - on_legal.sum()
     assert abs(illegal_mass) < 1e-6
 
 
 # ----- Output invariants -----
 
-def test_pi_sample_sums_to_one():
+def test_pi_improved_sums_to_one():
     state = chess_board_to_pgx_state(chess.Board())
     rng = np.random.default_rng(0)
     out = SP.sample_improved_policy_pgx(
         root_state=state, apply_fn=uniform_apply_fn,
         K=20, k_plies=2, beta=0.5, rng=rng, stratified=True, env=_ENV,
     )
-    assert out.pi_sample.sum() == pytest.approx(1.0, abs=1e-5)
+    assert out.pi_improved.sum() == pytest.approx(1.0, abs=1e-5)
 
 
-def test_pi_sample_zero_on_illegal_first_moves():
+def test_pi_improved_zero_on_illegal_first_moves():
     state = chess_board_to_pgx_state(chess.Board())
     rng = np.random.default_rng(0)
     out = SP.sample_improved_policy_pgx(
@@ -75,7 +75,7 @@ def test_pi_sample_zero_on_illegal_first_moves():
         K=20, k_plies=2, beta=1.0, rng=rng, stratified=True, env=_ENV,
     )
     legal = set(int(i) for i in np.where(np.array(state.legal_action_mask))[0])
-    illegal_mass = sum(p for i, p in enumerate(out.pi_sample) if i not in legal)
+    illegal_mass = sum(p for i, p in enumerate(out.pi_improved) if i not in legal)
     assert abs(illegal_mass) < 1e-6
 
 
@@ -136,4 +136,4 @@ def test_terminal_root_returns_immediately():
         root_state=state, apply_fn=uniform_apply_fn,
         K=4, k_plies=2, beta=1.0, env=_ENV,
     )
-    assert out.pi_sample.sum() == 0.0
+    assert out.pi_improved.sum() == 0.0

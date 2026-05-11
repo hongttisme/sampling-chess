@@ -41,7 +41,7 @@ ApplyFn = Callable[[list], Tuple[np.ndarray, np.ndarray]]
 
 @dataclass
 class SamplingResultPgx:
-    pi_sample: np.ndarray   # (4672,) float32, sums to 1 over legal first moves
+    pi_improved: np.ndarray  # (4672,) float32, sums to 1 over legal first moves
     v_plus: float           # SNIS-weighted leaf value, root POV
     leaf_values: np.ndarray # (K,) float32, V_i for each trajectory (root POV)
     first_moves: np.ndarray # (K,) int32, pgx action index of a_0^(i)
@@ -119,7 +119,7 @@ def sample_improved_policy_pgx(
         rewards = np.array(root_state.rewards)
         v = float(rewards[root_player]) if root_state.terminated else 0.0
         return SamplingResultPgx(
-            pi_sample=np.zeros(A, dtype=np.float32),
+            pi_improved=np.zeros(A, dtype=np.float32),
             v_plus=v,
             leaf_values=np.full(K, v, dtype=np.float32),
             first_moves=np.full(K, -1, dtype=np.int32),
@@ -188,13 +188,13 @@ def sample_improved_policy_pgx(
     w = np.exp(z)
     w /= w.sum()
 
-    pi_sample = np.zeros(A, dtype=np.float32)
-    np.add.at(pi_sample, first_moves, w.astype(np.float32))
+    pi_improved = np.zeros(A, dtype=np.float32)
+    np.add.at(pi_improved, first_moves, w.astype(np.float32))
 
     v_plus = float((w * leaf_values).sum())
 
     return SamplingResultPgx(
-        pi_sample=pi_sample,
+        pi_improved=pi_improved,
         v_plus=v_plus,
         leaf_values=leaf_values.astype(np.float32),
         first_moves=first_moves,

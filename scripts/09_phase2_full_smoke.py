@@ -23,8 +23,11 @@ import pgx
 
 from sampling_chess.iter_driver import run_phase2
 from sampling_chess.net import ChessTransformerPgx, count_params
-from sampling_chess.search import MctsArmA
-from sampling_chess.selfplay import make_arm_b_op_builder
+from sampling_chess.search import MctsArmA, MctsArmABatched
+from sampling_chess.selfplay import (
+    make_arm_b_batched_op_builder,
+    make_arm_b_op_builder,
+)
 from sampling_chess.train import make_optimizer
 
 
@@ -63,6 +66,8 @@ def main() -> int:
                         help="Arm B: SNIS sharpening parameter")
     parser.add_argument("--num-sims", type=int, default=100,
                         help="Arm A: mctx num_simulations per move")
+    parser.add_argument("--no-batched", action="store_true",
+                        help="disable vmap-over-games self-play (slower; for debugging)")
     args = parser.parse_args()
 
     print(f"[init] arm={args.arm}, iters={args.iters}, "
@@ -86,16 +91,37 @@ def main() -> int:
             config=vars(args),
         )
 
-    if args.arm == "a":
-        arm_a = MctsArmA(model=model, params=params, num_simulations=args.num_sims)
-        def op_builder(p):
-            arm_a.params = p
-            return arm_a.improve_at_state
+    use_batched = not args.no_batched
+    if use_batched:
+        if args.arm == "a":
+            arm_a_batched = MctsArmABatched(
+                model=model, params=params,
+                n_games=args.games_per_iter,
+                num_simulations=args.num_sims, env=env,
+            )
+            def op_builder(p):
+                arm_a_batched.params = p
+                def op(states_batched, _key):
+                    return arm_a_batched.improve_at_states(states_batched)
+                return op
+        else:
+            op_builder = make_arm_b_batched_op_builder(
+                model, K=args.K, k_plies=args.k_plies, beta=args.beta,
+                n_games=args.games_per_iter,
+                rng=np.random.default_rng(0), env=env,
+            )
     else:
-        op_builder = make_arm_b_op_builder(
-            model, K=args.K, k_plies=args.k_plies, beta=args.beta,
-            rng=np.random.default_rng(0), env=env,
-        )
+        if args.arm == "a":
+            arm_a = MctsArmA(model=model, params=params,
+                             num_simulations=args.num_sims)
+            def op_builder(p):
+                arm_a.params = p
+                return arm_a.improve_at_state
+        else:
+            op_builder = make_arm_b_op_builder(
+                model, K=args.K, k_plies=args.k_plies, beta=args.beta,
+                rng=np.random.default_rng(0), env=env,
+            )
 
     optimizer = make_optimizer(
         lr=1e-3, warmup_steps=2,
@@ -109,7 +135,7 @@ def main() -> int:
         games_per_iter=args.games_per_iter,
         train_steps_per_iter=args.train_steps,
         batch_size=args.batch,
-        buffer_capacity=500,
+        buffer_capacity=10_000,
         env=env,
         eval_every=args.eval_every,
         eval_skills=(args.eval_skill,),
@@ -121,6 +147,7 @@ def main() -> int:
         wandb_active=wandb_active,
         ckpt_dir=args.ckpt_dir,
         resume=not args.no_resume,
+        batched=use_batched,
     )
     total_t = time.time() - t0
 

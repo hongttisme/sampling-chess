@@ -196,3 +196,131 @@ class MctsArmA:
         """chess.Board entry point; goes through the (slow) FEN bridge."""
         state = pgx_bridge.chess_board_to_pgx_state(board)
         return self.improve_at_state(state)
+
+
+# ---------------------------------------------------------------------------
+# Batched (vmap-over-games) MCTS for Phase 2 self-play
+# ---------------------------------------------------------------------------
+
+class MctsArmABatched:
+    """MCTS arm processing N root states in parallel via mctx's native batch dim.
+
+    Single MctsArmA instance + batch=1 leaves Blackwell at ~20% utilization in
+    self-play because each per-game per-ply sampler call has Python+dispatch
+    overhead that dwarfs the small GPU compute. This variant takes batched
+    states (leading dim n_games) so a single mctx call covers all games' MCTS
+    in one jit graph.
+
+    n_games is fixed at construction time. Build a fresh instance for a
+    different batch size.
+    """
+
+    def __init__(
+        self,
+        model,
+        params,
+        n_games: int,
+        num_simulations: int = 100,
+        c_puct_init: float = 1.25,
+        c_puct_base: float = 19652.0,
+        dirichlet_alpha: float = 0.3,
+        dirichlet_fraction: float = 0.25,
+        rng_seed: int = 0,
+        env=None,
+    ):
+        if not _MCTX_AVAILABLE:
+            raise ImportError("mctx and pgx are required for MctsArmABatched")
+        if not pgx_bridge.is_available():
+            raise ImportError("pgx_bridge / pgx not available")
+        if n_games < 1:
+            raise ValueError(f"n_games must be >= 1, got {n_games}")
+
+        self.model = model
+        self.params = params
+        self.n_games = n_games
+        self.num_simulations = num_simulations
+        self.c_puct_init = c_puct_init
+        self.c_puct_base = c_puct_base
+        self.dirichlet_alpha = dirichlet_alpha
+        self.dirichlet_fraction = dirichlet_fraction
+        self._rng = jax.random.key(rng_seed)
+        self._env = env or _pgx.make("chess")
+        self._step_v = jax.vmap(self._env.step, in_axes=(0, 0, 0))
+        self._root_fn = jax.jit(self._build_root_fn())
+        self._recurrent_fn = self._build_recurrent_fn()
+        self._policy_fn = jax.jit(self._build_policy_fn())
+
+    def _build_root_fn(self):
+        model = self.model
+
+        def root_fn(params, states):
+            # states already batched with leading dim n_games.
+            logits, value = model.apply({"params": params}, states.observation)
+            return mctx.RootFnOutput(
+                prior_logits=logits,
+                value=value,
+                embedding=states,
+            )
+        return root_fn
+
+    def _build_recurrent_fn(self):
+        # Identical to MctsArmA._build_recurrent_fn — already handles batched
+        # action/embedding (mctx passes them through with the batch dim).
+        model = self.model
+        step_v = self._step_v
+
+        def recurrent_fn(params, rng_key, action, embedding):
+            keys = jax.random.split(rng_key, action.shape[0])
+            new_state = step_v(embedding, action, keys)
+            logits, value = model.apply({"params": params}, new_state.observation)
+            actor = 1 - new_state.current_player
+            rewards = new_state.rewards
+            reward = jnp.take_along_axis(rewards, actor[:, None], axis=1)[:, 0]
+            discount = jnp.where(new_state.terminated, 0.0, -1.0)
+            logits = jnp.where(new_state.legal_action_mask, logits, -1e9)
+            output = mctx.RecurrentFnOutput(
+                reward=reward,
+                discount=discount,
+                prior_logits=logits,
+                value=value,
+            )
+            return output, new_state
+        return recurrent_fn
+
+    def _build_policy_fn(self):
+        recurrent_fn = self._recurrent_fn
+        num_simulations = self.num_simulations
+        c_puct_init = self.c_puct_init
+        c_puct_base = self.c_puct_base
+        dirichlet_alpha = self.dirichlet_alpha
+        dirichlet_fraction = self.dirichlet_fraction
+
+        def policy_fn(params, rng_key, root, invalid_actions):
+            return mctx.muzero_policy(
+                params=params,
+                rng_key=rng_key,
+                root=root,
+                recurrent_fn=recurrent_fn,
+                num_simulations=num_simulations,
+                invalid_actions=invalid_actions,
+                pb_c_init=c_puct_init,
+                pb_c_base=c_puct_base,
+                dirichlet_alpha=dirichlet_alpha,
+                dirichlet_fraction=dirichlet_fraction,
+            )
+        return policy_fn
+
+    def improve_at_states(self, states):
+        """Run mctx on n_games batched root states. Returns (pi (N, 4672) float32,
+        v_plus (N,) float32)."""
+        root = self._root_fn(self.params, states)
+        invalid_actions = ~states.legal_action_mask  # (N, 4672), already batched
+
+        self._rng, subkey = jax.random.split(self._rng)
+        out = self._policy_fn(self.params, subkey, root, invalid_actions)
+        weights = np.asarray(out.action_weights, dtype=np.float32)  # (N, 4672)
+        try:
+            v_plus = np.asarray(out.search_tree.summary().value, dtype=np.float32)
+        except Exception:
+            v_plus = np.zeros(self.n_games, dtype=np.float32)
+        return weights, v_plus

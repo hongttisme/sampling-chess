@@ -163,7 +163,7 @@ def play_self_game(
 def make_arm_b_op_builder(model, *, K: int = 64, k_plies: int = 8,
                           beta: float = 1.0, env=None,
                           rng: Optional[np.random.Generator] = None):
-    """Returns op_builder(params) -> ImprovementOp.
+    """Returns op_builder(params) -> ImprovementOp (single-state).
 
     Builds the JIT'd sampler ONCE (via make_jit_sampler) and reuses it across
     iterations; only `params` change between iterations. Use this in the
@@ -189,6 +189,211 @@ def make_arm_b_op_builder(model, *, K: int = 64, k_plies: int = 8,
         return op
 
     return op_builder
+
+
+# ---------------------------------------------------------------------------
+# Batched (vmap-over-games) Arm B operator
+# ---------------------------------------------------------------------------
+
+def make_arm_b_batched_op_builder(model, *, K: int, k_plies: int,
+                                  beta: float, n_games: int,
+                                  env=None,
+                                  rng: Optional[np.random.Generator] = None):
+    """Returns op_builder(params) -> op_batched(states_batched, key)
+                              -> (pi_improved (N, 4672), v_plus (N,)).
+
+    The underlying jit sampler is vmapped over n_games so a single sample call
+    processes all N games' rollouts in parallel on GPU. Massive throughput
+    win on Blackwell vs the single-game sampler called N times sequentially.
+
+    n_games must be fixed at build time (it's a vmap axis). To support a
+    different n_games, build a fresh op_builder.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    if env is None and _PGX_AVAILABLE:
+        env = pgx.make("chess")
+    if n_games < 1:
+        raise ValueError(f"n_games must be >= 1, got {n_games}")
+
+    from sampling_chess.sampling_pgx import (
+        make_jit_sampler,
+        PGX_NUM_ACTIONS,
+    )
+
+    sampler = make_jit_sampler(model, K=K, k_plies=k_plies, env=env)
+    # vmap over root states: (params, batched_state, batched_key) -> batched outputs
+    batched_sampler = jax.vmap(sampler, in_axes=(None, 0, 0))
+
+    def op_builder(params):
+        def op(states_batched, key):
+            sub_keys = jax.random.split(key, n_games)
+            (first_actions_j, leaf_v_stm_j, leaf_player_j,
+             was_terminal_j, captured_rewards_j) = batched_sampler(
+                params, states_batched, sub_keys
+            )
+            first_actions = np.asarray(first_actions_j)        # (N, K)
+            leaf_v_stm = np.asarray(leaf_v_stm_j)              # (N, K)
+            leaf_player = np.asarray(leaf_player_j)            # (N, K)
+            was_terminal = np.asarray(was_terminal_j)          # (N, K)
+            captured_rewards = np.asarray(captured_rewards_j)  # (N, K, 2)
+
+            root_players = np.asarray(states_batched.current_player)  # (N,)
+
+            pi_batch = np.zeros((n_games, PGX_NUM_ACTIONS), dtype=np.float32)
+            v_batch = np.zeros(n_games, dtype=np.float32)
+            for i in range(n_games):
+                rp = int(root_players[i])
+                v_nonterm = np.where(
+                    leaf_player[i] == rp, leaf_v_stm[i], -leaf_v_stm[i]
+                ).astype(np.float32)
+                v_term = captured_rewards[i, :, rp].astype(np.float32)
+                leaf_values = np.where(was_terminal[i], v_term, v_nonterm)
+                z = beta * leaf_values
+                z = z - z.max()
+                w = np.exp(z)
+                w = w / w.sum()
+                pi = np.zeros(PGX_NUM_ACTIONS, dtype=np.float32)
+                np.add.at(pi, first_actions[i].astype(np.int32),
+                          w.astype(np.float32))
+                pi_batch[i] = pi
+                v_batch[i] = float((w * leaf_values).sum())
+
+            return pi_batch, v_batch
+
+        return op
+    return op_builder
+
+
+# ---------------------------------------------------------------------------
+# Batched (vmap-over-games) self-play loop
+# ---------------------------------------------------------------------------
+
+def play_self_games_batched(
+    op_batched: Callable,   # (states_batched, key) -> (pi (N, A), v_plus (N,))
+    n_games: int,
+    *,
+    env=None,
+    max_plies: int = 200,
+    temperature_threshold: int = 30,
+    rng: Optional[np.random.Generator] = None,
+    starting_states=None,
+) -> list:
+    """Play `n_games` self-play games synchronized over plies via vmap.
+
+    Each ply: 1 batched op call + 1 vmapped env.step. Per-game completion is
+    tracked in Python (`done[i]` mask); after a game terminates we keep the
+    pgx state stepping (it stays terminal in pgx) but don't append rows to
+    the trajectory and freeze the captured rewards.
+
+    Returns: list of `n_games` Trajectory objects.
+    """
+    if not _PGX_AVAILABLE:
+        raise ImportError("pgx not installed")
+    if env is None:
+        env = pgx.make("chess")
+    if rng is None:
+        rng = np.random.default_rng()
+
+    vmap_step = jax.jit(jax.vmap(env.step))
+    vmap_init = jax.jit(jax.vmap(env.init))
+
+    if starting_states is None:
+        init_keys = jax.random.split(
+            jax.random.key(int(rng.integers(2**31))), n_games
+        )
+        states = vmap_init(init_keys)
+    else:
+        states = starting_states
+
+    # Per-game per-ply lists.
+    obs_lists = [[] for _ in range(n_games)]
+    pi_lists = [[] for _ in range(n_games)]
+    mask_lists = [[] for _ in range(n_games)]
+    action_lists = [[] for _ in range(n_games)]
+    player_lists = [[] for _ in range(n_games)]
+
+    done = np.array(states.terminated, copy=True)  # (N,) bool
+    captured_rewards = np.array(states.rewards, copy=True)  # (N, 2)
+
+    from sampling_chess.pgx_bridge import PGX_NUM_ACTIONS
+
+    for ply in range(max_plies):
+        if bool(done.all()):
+            break
+
+        op_key = jax.random.key(int(rng.integers(2**31)))
+        pi_imp_batch, _ = op_batched(states, op_key)  # (N, A), (N,)
+        pi_imp_batch = np.asarray(pi_imp_batch)
+
+        legal_mask_batch = np.asarray(states.legal_action_mask)  # (N, A)
+        observation_batch = np.asarray(states.observation)      # (N, 8, 8, 119)
+        current_player_batch = np.asarray(states.current_player)  # (N,)
+
+        actions = np.zeros(n_games, dtype=np.int32)
+        for i in range(n_games):
+            if done[i]:
+                continue
+            pi = pi_imp_batch[i]
+            mass = float(pi.sum())
+            if mass <= 0:
+                mask_f = legal_mask_batch[i].astype(np.float32)
+                probs = mask_f / max(float(mask_f.sum()), 1.0)
+            else:
+                probs = pi / mass
+            if ply < temperature_threshold:
+                actions[i] = int(rng.choice(PGX_NUM_ACTIONS, p=probs))
+            else:
+                actions[i] = int(np.argmax(probs))
+
+        for i in range(n_games):
+            if done[i]:
+                continue
+            obs_lists[i].append(observation_batch[i])
+            pi_lists[i].append(pi_imp_batch[i])
+            mask_lists[i].append(legal_mask_batch[i])
+            action_lists[i].append(actions[i])
+            player_lists[i].append(int(current_player_batch[i]))
+
+        step_keys = jax.random.split(
+            jax.random.key(int(rng.integers(2**31))), n_games
+        )
+        actions_jnp = jnp.asarray(actions, dtype=jnp.int32)
+        new_states = vmap_step(states, actions_jnp, step_keys)
+
+        new_term = np.asarray(new_states.terminated)
+        newly_terminal = new_term & (~done)
+        new_rewards = np.asarray(new_states.rewards)
+        captured_rewards = np.where(
+            newly_terminal[:, None], new_rewards, captured_rewards
+        )
+        done = done | new_term
+        states = new_states
+
+    trajs = []
+    for i in range(n_games):
+        T = len(obs_lists[i])
+        if T == 0:
+            trajs.append(Trajectory(
+                observations=np.zeros((0, 8, 8, 119), dtype=np.float32),
+                improved_policies=np.zeros((0, PGX_NUM_ACTIONS), dtype=np.float32),
+                legal_masks=np.zeros((0, PGX_NUM_ACTIONS), dtype=bool),
+                actions=np.zeros(0, dtype=np.int32),
+                player_at_step=np.zeros(0, dtype=np.int32),
+                outcome_per_player=captured_rewards[i].astype(np.float32),
+                plies=0, terminated=bool(done[i]),
+            ))
+            continue
+        trajs.append(Trajectory(
+            observations=np.stack(obs_lists[i]).astype(np.float32),
+            improved_policies=np.stack(pi_lists[i]).astype(np.float32),
+            legal_masks=np.stack(mask_lists[i]),
+            actions=np.array(action_lists[i], dtype=np.int32),
+            player_at_step=np.array(player_lists[i], dtype=np.int32),
+            outcome_per_player=captured_rewards[i].astype(np.float32),
+            plies=T, terminated=bool(done[i]),
+        ))
+    return trajs
 
 
 def make_arm_b_op(model, params, *, K: int = 64, k_plies: int = 8,

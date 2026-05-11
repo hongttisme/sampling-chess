@@ -72,6 +72,90 @@ def load_latest_ckpt(ckpt_dir):
     return d["iter"], d["params"]
 
 
+def phase2_iter_batched(
+    op_batched_builder: Callable,    # params -> (states_batched, key) -> (pi (N,A), v (N,))
+    model,
+    train_state,
+    buffer: ReplayBuffer,
+    rng: np.random.Generator,
+    *,
+    games_per_iter: int = 16,
+    train_steps_per_iter: int = 100,
+    batch_size: int = 64,
+    env=None,
+    max_plies: int = 200,
+    temperature_threshold: int = 30,
+) -> tuple:
+    """Phase 2 iteration with vmap-over-games self-play.
+
+    Self-play is a SINGLE batched op call per ply over all games_per_iter
+    games, plus one vmapped env.step. Reduces dispatch overhead by N=games_per_iter.
+    """
+    from sampling_chess.selfplay import play_self_games_batched
+
+    if env is None:
+        env = pgx.make("chess")
+
+    op_batched = op_batched_builder(train_state.params)
+
+    sp_t0 = time.time()
+    trajs = play_self_games_batched(
+        op_batched=op_batched,
+        n_games=games_per_iter,
+        env=env, max_plies=max_plies,
+        temperature_threshold=temperature_threshold,
+        rng=rng,
+    )
+
+    n_white_wins = n_black_wins = n_draws = 0
+    total_plies = 0
+    for traj in trajs:
+        buffer.add_trajectory(traj)
+        total_plies += traj.plies
+        rw = float(traj.outcome_per_player[0])
+        if rw > 0:
+            n_white_wins += 1
+        elif rw < 0:
+            n_black_wins += 1
+        else:
+            n_draws += 1
+    sp_dt = time.time() - sp_t0
+
+    train_step = make_train_step_phase2(model, lambda_v=1.0)
+    tr_t0 = time.time()
+    acc = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "grad_norm": 0.0}
+    n_train = 0
+    if len(buffer) >= batch_size:
+        for _ in range(train_steps_per_iter):
+            batch = buffer.sample(batch_size, rng)
+            jbatch = {k: jnp.asarray(v) for k, v in batch.items()}
+            train_state, metrics = train_step(train_state, jbatch)
+            for k, v in metrics.items():
+                acc[k] += float(v)
+            n_train += 1
+    tr_dt = time.time() - tr_t0
+    avg_train = {k: (v / max(1, n_train)) for k, v in acc.items()}
+
+    metrics = {
+        "selfplay": {
+            "games": games_per_iter,
+            "total_plies": total_plies,
+            "avg_plies": total_plies / max(1, games_per_iter),
+            "white_wins": n_white_wins,
+            "black_wins": n_black_wins,
+            "draws": n_draws,
+            "wall_clock_sec": sp_dt,
+        },
+        "train": {
+            **avg_train,
+            "n_steps": n_train,
+            "wall_clock_sec": tr_dt,
+        },
+        "buffer_size": len(buffer),
+    }
+    return train_state, metrics
+
+
 def phase2_iter(
     op_builder: Callable,            # params -> (state -> result)
     model,
@@ -245,6 +329,7 @@ def run_phase2(
     wandb_active: bool = False,
     ckpt_dir: Optional[str] = None,
     resume: bool = True,
+    batched: bool = False,
 ):
     """Run N Phase 2 iterations; return final TrainState + per-iter metrics list.
 
@@ -272,9 +357,10 @@ def run_phase2(
 
     state = init_train_state(model, init_params_to_use, optimizer)
 
+    iter_fn = phase2_iter_batched if batched else phase2_iter
     history = []
     for it in range(start_iter, n_iterations + 1):
-        state, m = phase2_iter(
+        state, m = iter_fn(
             op_builder, model, state, buffer, rng,
             games_per_iter=games_per_iter,
             train_steps_per_iter=train_steps_per_iter,

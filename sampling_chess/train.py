@@ -197,13 +197,67 @@ def make_train_step(model, lambda_v: float = 1.0):
 
 
 def make_train_step_pgx(model, lambda_v: float = 1.0):
-    """Plan A: train_step factory for ChessTransformerPgx (single observation arg)."""
+    """Plan A SL: train_step factory for ChessTransformerPgx with sparse top-k targets."""
 
     def loss_fn(params, batch):
         logits, value = model.apply({"params": params}, batch["observation"])
         p_loss = policy_loss_fn(logits, batch["masks"],
                                 batch["target_idx"], batch["target_prob"])
         v_loss = value_loss_fn(value, batch["target_value"])
+        loss = p_loss + lambda_v * v_loss
+        return loss, (p_loss, v_loss)
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+
+    @jax.jit
+    def train_step(state, batch):
+        (loss, (p_loss, v_loss)), grads = grad_fn(state.params, batch)
+        state = state.apply_gradients(grads=grads)
+        gn = optax.tree.norm(grads)
+        return state, {
+            "loss": loss,
+            "policy_loss": p_loss,
+            "value_loss": v_loss,
+            "grad_norm": gn,
+        }
+
+    return train_step
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: dense policy targets (self-play improvement targets)
+# ---------------------------------------------------------------------------
+
+def dense_policy_loss_fn(logits: jnp.ndarray, legal_mask: jnp.ndarray,
+                         pi_target: jnp.ndarray) -> jnp.ndarray:
+    """Cross-entropy against the full pi_improved distribution.
+
+    Args:
+      logits      (B, A) raw policy logits
+      legal_mask  (B, A) bool, True for legal actions
+      pi_target   (B, A) float32, soft policy target (sums to 1 over legal)
+
+    Returns: scalar loss.
+
+    pi_target is 0 on illegal actions (by construction in the improvement
+    operators), so the product pi_target * log_probs is well-defined even
+    with masked logits.
+    """
+    masked = jnp.where(legal_mask, logits, -1e9)
+    log_probs = jax.nn.log_softmax(masked, axis=-1)
+    per_example = -(pi_target * log_probs).sum(axis=-1)
+    return per_example.mean()
+
+
+def make_train_step_phase2(model, lambda_v: float = 1.0):
+    """Phase 2 train_step: dense pi_improved policy CE + value MSE."""
+
+    def loss_fn(params, batch):
+        logits, value = model.apply({"params": params}, batch["observation"])
+        p_loss = dense_policy_loss_fn(
+            logits, batch["legal_mask"], batch["pi_improved"]
+        )
+        v_loss = value_loss_fn(value, batch["value_target"])
         loss = p_loss + lambda_v * v_loss
         return loss, (p_loss, v_loss)
 

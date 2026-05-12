@@ -84,11 +84,16 @@ def main() -> int:
                         help="attention heads (default: 6 = doc-spec)")
     parser.add_argument("--ffn-dim", type=int, default=1536,
                         help="FFN hidden dim (default: 1536 = doc-spec)")
-    parser.add_argument("--temperature-threshold", type=int, default=30,
+    parser.add_argument("--temperature-threshold", type=int, default=10**6,
                         help="plies sampled (tau=1) before greedy argmax kicks in. "
-                             "doc-spec is ~30. Larger threshold = more exploration "
-                             "throughout the game; too small + trained net -> "
-                             "deterministic argmax loops -> draws. (default: 30)")
+                             "DEFAULT now = never go argmax (always sample). "
+                             "Reason: with max_plies >= 200 and a trained net, "
+                             "the argmax phase becomes deterministic move loops "
+                             "between two trained nets -> games hit max_plies cap "
+                             "-> draw collapse. doc-spec value is 30 but it does "
+                             "not generalize to our max_plies = 400 + 16M net + "
+                             "1000-step train regime. Pass a small int explicitly "
+                             "(e.g. 30) to enable an argmax tail anyway.")
     args = parser.parse_args()
 
     print(f"[init] arm={args.arm}, iters={args.iters}, "

@@ -54,7 +54,15 @@ def main() -> int:
     parser.add_argument("--ckpt-dir", type=Path, default=Path("checkpoints"))
     parser.add_argument("--wandb", action="store_true", help="enable wandb logging")
     parser.add_argument("--name", default=None, help="wandb run name")
-    parser.add_argument("--group", default="phase1-sl", help="wandb group")
+    parser.add_argument("--group", default="sl-bot", help="wandb group")
+    # Model size knobs (default doc-spec ~16M; pass bigger for ~50M+)
+    parser.add_argument("--n-layers", type=int, default=8)
+    parser.add_argument("--d-model", type=int, default=384)
+    parser.add_argument("--n-heads", type=int, default=6)
+    parser.add_argument("--ffn-dim", type=int, default=1536)
+    # Resume support
+    parser.add_argument("--no-resume", action="store_true",
+                        help="ignore any existing checkpoint in --ckpt-dir")
     args = parser.parse_args()
 
     args.ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -83,11 +91,31 @@ def main() -> int:
           f"batch={args.batch_size}")
 
     # Model + state
-    model = ChessTransformer()
+    model = ChessTransformer(
+        n_layers=args.n_layers, d_model=args.d_model,
+        n_heads=args.n_heads, ffn_dim=args.ffn_dim,
+    )
     init_pieces = jnp.asarray(data["pieces"][:1].astype(np.int32))
     init_globals = jnp.asarray(data["globals"][:1])
     params = model.init(jax.random.key(args.seed), init_pieces, init_globals)["params"]
-    print(f"[model] {count_params(params):,} params")
+    print(f"[model] {count_params(params):,} params  "
+          f"(n_layers={args.n_layers}, d_model={args.d_model}, "
+          f"n_heads={args.n_heads}, ffn_dim={args.ffn_dim})")
+
+    # Resume from latest ckpt if present + not --no-resume
+    start_step = 0
+    args.ckpt_dir.mkdir(parents=True, exist_ok=True)
+    latest = args.ckpt_dir / "latest.pkl"
+    if latest.exists() and not args.no_resume:
+        with open(latest, "rb") as f:
+            cp = pickle.load(f)
+        if cp.get("config") and cp["config"].get("n_layers") != args.n_layers:
+            print(f"[warn] ckpt arch ({cp['config']}) differs from request; "
+                  f"ignoring (use --no-resume to start fresh)")
+        else:
+            params = cp["params"]
+            start_step = int(cp.get("step", 0))
+            print(f"[resume] loaded ckpt at step {start_step}")
 
     optimizer = make_optimizer(
         lr=args.lr, warmup_steps=args.warmup, total_steps=args.steps,
@@ -95,8 +123,8 @@ def main() -> int:
     state = init_train_state(model, params, optimizer)
     train_step = make_train_step(model, lambda_v=args.lambda_v)
 
-    # Training loop
-    step = 0
+    # Training loop (continues from start_step on resume)
+    step = start_step
     t_start = time.time()
     last_log_t = t_start
     metrics_acc: dict = {}
@@ -131,6 +159,9 @@ def main() -> int:
 
         if step % args.ckpt_every == 0:
             ckpt_path = _save_ckpt(args.ckpt_dir, step, state.params, vars(args))
+            # Also write a latest.pkl for easy resume.
+            import shutil
+            shutil.copy(ckpt_path, args.ckpt_dir / "latest.pkl")
             print(f"[ckpt] {ckpt_path}")
             if wandb_active:
                 log.log_artifact(str(ckpt_path), name=f"ckpt_{step}", artifact_type="model")

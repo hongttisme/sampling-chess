@@ -31,18 +31,18 @@ from sampling_chess import board as B
 # ---------------------------------------------------------------------------
 
 def load_dataset(path: Path) -> dict:
-    """Load .npz produced by scripts/02_label_batch.py + pre-encode boards
-    using OUR (pieces, globals, masks) encoding.
+    """Load .npz produced by scripts/02_label_batch.py and pre-encode boards.
 
     Returns a dict with numpy arrays:
       pieces       (N, 8, 8) int8     piece-plane encoding
       globals      (N, 9) float32     global features
       masks        (N, NUM_ACTIONS) bool   legal-move mask (4288)
-      target_idx   (N, k) int32       move indices in our 4288 space (padded -1)
+      target_idx   (N, k) int32       top-k move indices (padded -1)
       target_prob  (N, k) float32     soft policy targets (padded 0)
       target_value (N,) float32       scalar value target
 
-    Use load_dataset_pgx for pgx-encoded data (Plan A pipeline).
+    The board-encoding pass is single-threaded (~50 us/position). For 500k
+    positions this is ~25s; for 2M, swap for a streaming dataloader.
     """
     raw = np.load(path)
     fens = raw["fens"]
@@ -60,60 +60,6 @@ def load_dataset(path: Path) -> dict:
     return {
         "pieces": pieces,
         "globals": globals_,
-        "masks": masks,
-        "target_idx": raw["move_indices"].astype(np.int32),
-        "target_prob": raw["move_probs"].astype(np.float32),
-        "target_value": raw["value_targets"].astype(np.float32),
-    }
-
-
-def load_dataset_pgx(path: Path) -> dict:
-    """Plan A pipeline: load a .npz produced by scripts/04_relabel_pgx.py.
-
-    The .npz is expected to already contain pre-encoded pgx observations
-    and legal masks (relabel script computes these once per labeling job;
-    pgx's _from_fen is ~30 ms/pos in JAX-traced overhead, fine once but
-    a 17-hour cold-start penalty at 2M positions if done on every load).
-
-    Returns a dict with numpy arrays:
-      observation  (N, 8, 8, 119) float32   pgx state.observation
-      masks        (N, 4672) bool           pgx legal_action_mask
-      target_idx   (N, k) int32             move indices in pgx 4672 space
-      target_prob  (N, k) float32           soft policy targets (padded 0)
-      target_value (N,) float32             scalar value target
-
-    Falls back to per-position pgx encoding if the .npz lacks observation
-    + masks (older data files); slow, emits a warning.
-    """
-    raw = np.load(path)
-
-    if "observation" in raw.files and "masks" in raw.files:
-        return {
-            "observation": raw["observation"].astype(np.float32),
-            "masks": raw["masks"].astype(bool),
-            "target_idx": raw["move_indices"].astype(np.int32),
-            "target_prob": raw["move_probs"].astype(np.float32),
-            "target_value": raw["value_targets"].astype(np.float32),
-        }
-
-    print("[warn] dataset lacks pre-encoded observation/masks; "
-          "falling back to per-position pgx_from_fen (slow). "
-          "Re-run scripts/04_relabel_pgx.py to refresh.")
-    from sampling_chess.pgx_bridge import chess_board_to_pgx_state
-    from sampling_chess.net import PGX_NUM_ACTIONS, PGX_OBSERVATION_CHANNELS
-
-    fens = raw["fens"]
-    n = len(fens)
-    obs = np.zeros((n, 8, 8, PGX_OBSERVATION_CHANNELS), dtype=np.float32)
-    masks = np.zeros((n, PGX_NUM_ACTIONS), dtype=bool)
-    for i, fen in enumerate(fens):
-        bd = chess.Board(str(fen))
-        state = chess_board_to_pgx_state(bd)
-        obs[i] = np.asarray(state.observation, dtype=np.float32)
-        masks[i] = np.asarray(state.legal_action_mask, dtype=bool)
-
-    return {
-        "observation": obs,
         "masks": masks,
         "target_idx": raw["move_indices"].astype(np.int32),
         "target_prob": raw["move_probs"].astype(np.float32),
@@ -165,7 +111,11 @@ def value_loss_fn(pred_v: jnp.ndarray, target_v: jnp.ndarray) -> jnp.ndarray:
 
 
 def make_train_step(model, lambda_v: float = 1.0):
-    """Build a JIT'd train_step for the legacy (pieces, globals) net."""
+    """Build a JIT'd (state, batch) -> (state, metrics) train step.
+
+    Loss = policy_CE + lambda_v * value_MSE. Metrics include policy_loss,
+    value_loss, total loss, and grad_norm.
+    """
 
     def loss_fn(params, batch):
         logits, value = model.apply(
@@ -176,88 +126,6 @@ def make_train_step(model, lambda_v: float = 1.0):
         p_loss = policy_loss_fn(logits, batch["masks"],
                                 batch["target_idx"], batch["target_prob"])
         v_loss = value_loss_fn(value, batch["target_value"])
-        loss = p_loss + lambda_v * v_loss
-        return loss, (p_loss, v_loss)
-
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-
-    @jax.jit
-    def train_step(state, batch):
-        (loss, (p_loss, v_loss)), grads = grad_fn(state.params, batch)
-        state = state.apply_gradients(grads=grads)
-        gn = optax.tree.norm(grads)
-        return state, {
-            "loss": loss,
-            "policy_loss": p_loss,
-            "value_loss": v_loss,
-            "grad_norm": gn,
-        }
-
-    return train_step
-
-
-def make_train_step_pgx(model, lambda_v: float = 1.0):
-    """Plan A SL: train_step factory for ChessTransformerPgx with sparse top-k targets."""
-
-    def loss_fn(params, batch):
-        logits, value = model.apply({"params": params}, batch["observation"])
-        p_loss = policy_loss_fn(logits, batch["masks"],
-                                batch["target_idx"], batch["target_prob"])
-        v_loss = value_loss_fn(value, batch["target_value"])
-        loss = p_loss + lambda_v * v_loss
-        return loss, (p_loss, v_loss)
-
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-
-    @jax.jit
-    def train_step(state, batch):
-        (loss, (p_loss, v_loss)), grads = grad_fn(state.params, batch)
-        state = state.apply_gradients(grads=grads)
-        gn = optax.tree.norm(grads)
-        return state, {
-            "loss": loss,
-            "policy_loss": p_loss,
-            "value_loss": v_loss,
-            "grad_norm": gn,
-        }
-
-    return train_step
-
-
-# ---------------------------------------------------------------------------
-# Phase 2: dense policy targets (self-play improvement targets)
-# ---------------------------------------------------------------------------
-
-def dense_policy_loss_fn(logits: jnp.ndarray, legal_mask: jnp.ndarray,
-                         pi_target: jnp.ndarray) -> jnp.ndarray:
-    """Cross-entropy against the full pi_improved distribution.
-
-    Args:
-      logits      (B, A) raw policy logits
-      legal_mask  (B, A) bool, True for legal actions
-      pi_target   (B, A) float32, soft policy target (sums to 1 over legal)
-
-    Returns: scalar loss.
-
-    pi_target is 0 on illegal actions (by construction in the improvement
-    operators), so the product pi_target * log_probs is well-defined even
-    with masked logits.
-    """
-    masked = jnp.where(legal_mask, logits, -1e9)
-    log_probs = jax.nn.log_softmax(masked, axis=-1)
-    per_example = -(pi_target * log_probs).sum(axis=-1)
-    return per_example.mean()
-
-
-def make_train_step_phase2(model, lambda_v: float = 1.0):
-    """Phase 2 train_step: dense pi_improved policy CE + value MSE."""
-
-    def loss_fn(params, batch):
-        logits, value = model.apply({"params": params}, batch["observation"])
-        p_loss = dense_policy_loss_fn(
-            logits, batch["legal_mask"], batch["pi_improved"]
-        )
-        v_loss = value_loss_fn(value, batch["value_target"])
         loss = p_loss + lambda_v * v_loss
         return loss, (p_loss, v_loss)
 

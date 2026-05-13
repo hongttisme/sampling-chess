@@ -137,4 +137,9 @@ function sampleMove(scored, temperature) {
 // Mode → sampling temperature
 const MODE_TEMP = { greedy: 0, t03: 0.30, t07: 0.70 };
 
-window.BotEngine = { evalPosition, analyze, sampleMove, MODE_TEMP };
+// Per-sim cost estimate. Used by the UI to display "~Xs thinking time" for a
+// chosen MCTS sim count. Hard-coded for the prototype; the real backend should
+// overwrite this on startup with a value measured by sampling_chess.mcts.benchmark_per_sim.
+const msPerSim = 8.0;
+
+window.BotEngine = { evalPosition, analyze, sampleMove, MODE_TEMP, msPerSim };

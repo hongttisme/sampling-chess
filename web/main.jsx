@@ -66,6 +66,7 @@ function App() {
   // Game config
   const [playerColor, setPlayerColor] = React.useState('w');
   const [mode, setMode] = React.useState('greedy');
+  const [numSims, setNumSims] = React.useState(200);
 
   // Live game state
   const chessRef = React.useRef(null);
@@ -87,10 +88,11 @@ function App() {
   const [overDismissed, setOverDismissed] = React.useState(false);
 
   // ── Game lifecycle ───────────────────────────────────────────────────────
-  const startGame = React.useCallback(({ color, mode: m }) => {
+  const startGame = React.useCallback(({ color, mode: m, numSims: ns }) => {
     chessRef.current = new Chess();
     setPlayerColor(color);
     setMode(m);
+    if (ns !== undefined) setNumSims(ns);
     setOrientation(color);
     setFen(chessRef.current.fen());
     setHistory([]);
@@ -145,10 +147,12 @@ function App() {
       setThinking(false);
       const over = gameOverInfo(chessRef.current, playerColor);
       if (over) setOverState(over);
-    }, 700 + Math.random() * 600);
+      // Mock thinking-time scales with sim count (real backend will block on
+      // the actual MCTS call instead).
+    }, Math.max(300, numSims * ((window.BotEngine && window.BotEngine.msPerSim) || 8.0)) + Math.random() * 200);
 
     return () => { clearTimeout(timer); setThinking(false); };
-  }, [fen, screen, playerColor, mode, overState]);
+  }, [fen, screen, playerColor, mode, numSims, overState]);
 
   // ── User interaction ─────────────────────────────────────────────────────
   const handleSquareClick = React.useCallback((sq) => {

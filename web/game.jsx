@@ -50,10 +50,69 @@ function Welcome({ onStart }) {
   );
 }
 
+// ── Sim-depth picker (search budget) ──────────────────────────────────────
+// Lets the user pick how many MCTS simulations the bot runs per move.
+// numSims === 0 means "no search" (raw policy net only).
+// msPerSim is the per-sim wall-clock cost reported by the backend; while
+// the real bot isn't connected we use a placeholder estimate.
+function SimDepthPicker({ numSims, setNumSims, msPerSim }) {
+  const presets = [
+    { label: 'no search',    sims: 0   },
+    { label: 'fast',         sims: 50  },
+    { label: 'standard',     sims: 200 },
+    { label: 'strong',       sims: 800 },
+    { label: 'max',          sims: 1600 },
+  ];
+  const formatTime = (sims) => {
+    if (sims === 0) return 'instant';
+    const ms = sims * msPerSim;
+    if (ms < 1000) return `~${Math.round(ms)}ms`;
+    return `~${(ms / 1000).toFixed(ms < 5000 ? 1 : 0)}s`;
+  };
+  return (
+    <div className="setup-section">
+      <div className="setup-label">
+        thinking depth
+        <span className="setup-label-meta" style={{ marginLeft: 8, color: 'var(--muted)', fontWeight: 'normal', fontSize: '11px' }}>
+          MCTS sims · est. {msPerSim.toFixed(1)} ms/sim on this device
+        </span>
+      </div>
+      <div className="setup-options setup-modes">
+        {presets.map(p => (
+          <button
+            key={p.label}
+            className={`opt opt-mode ${numSims === p.sims ? 'opt-on' : ''}`}
+            onClick={() => setNumSims(p.sims)}
+          >
+            <span className="opt-name">{p.label}</span>
+            <span className="opt-sub">{p.sims === 0 ? 'policy net only' : `${p.sims} sims`}</span>
+            <span className="opt-tag">{formatTime(p.sims)}</span>
+          </button>
+        ))}
+      </div>
+      <div style={{ marginTop: 8, fontSize: '11px', color: 'var(--muted)', fontFamily: 'var(--font-mono)' }}>
+        custom: <input
+          type="range" min="0" max="2000" step="50" value={numSims}
+          onChange={e => setNumSims(parseInt(e.target.value))}
+          style={{ width: 160, verticalAlign: 'middle', margin: '0 8px' }}
+        />
+        <span style={{ display: 'inline-block', minWidth: 60 }}>{numSims} sims</span>
+        <span style={{ marginLeft: 8 }}>→ {formatTime(numSims)}</span>
+      </div>
+    </div>
+  );
+}
+
 // ── Setup card ────────────────────────────────────────────────────────────
 function Setup({ onStart, onBack }) {
   const [color, setColor] = React.useState('w');
   const [mode, setMode] = React.useState('greedy');
+  // Default: standard search (200 sims). 0 = no search (net only).
+  const [numSims, setNumSims] = React.useState(200);
+  // ms per sim estimate. Hard-coded until a real backend reports it via
+  // `window.BotEngine.benchmarkPerSim()`. Roughly: ~10ms on consumer GPU,
+  // ~1-3ms on Blackwell, 50-200ms on CPU only.
+  const msPerSim = (window.BotEngine && window.BotEngine.msPerSim) || 8.0;
 
   return (
     <div className="welcome">
@@ -120,11 +179,17 @@ function Setup({ onStart, onBack }) {
           </div>
         </div>
 
+        <SimDepthPicker
+          numSims={numSims}
+          setNumSims={setNumSims}
+          msPerSim={msPerSim}
+        />
+
         <button
           className="play-btn play-btn-start"
           onClick={() => {
             const actualColor = color === '?' ? (Math.random() < 0.5 ? 'w' : 'b') : color;
-            onStart({ color: actualColor, mode });
+            onStart({ color: actualColor, mode, numSims });
           }}
         >
           start game →

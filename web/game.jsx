@@ -39,6 +39,8 @@ function Welcome({ onStart }) {
         <div className="welcome-foot">
           <span>v0.4 · build a1b2c3</span>
           <span className="dot-sep">·</span>
+          <a href="Hub.html">all tools</a>
+          <span className="dot-sep">·</span>
           <a href="#" onClick={e => e.preventDefault()}>about</a>
           <span className="dot-sep">·</span>
           <a href="#" onClick={e => e.preventDefault()}>github</a>
@@ -137,13 +139,17 @@ function TopBar({ playerColor, mode, onResign, onNewGame, onFlip, onAbout, gameO
   return (
     <div className="topbar">
       <div className="topbar-left">
-        <span className="brand brand-small">bottisme<span className="brand-dot">.</span></span>
+        <a href="Hub.html" className="brand brand-small" style={{ textDecoration: 'none', color: 'inherit' }}>
+          bottisme<span className="brand-dot">.</span>
+        </a>
+        <span className="crumb-sep" style={{ color: 'var(--muted)', margin: '0 4px' }}>/</span>
         <span className="topbar-meta">
           <span className="chip">you · {playerColor === 'w' ? 'white' : 'black'}</span>
           <span className="chip chip-mode">mode · {mode}</span>
         </span>
       </div>
       <div className="topbar-right">
+        <a href="Hub.html" className="bar-btn" title="Back to all tools">↩ hub</a>
         <button className="bar-btn" onClick={onFlip} title="Flip board">⇅ flip</button>
         {!gameOver && <button className="bar-btn" onClick={onResign}>resign</button>}
         <button className="bar-btn bar-btn-primary" onClick={onNewGame}>+ new game</button>

@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bottisme — tools</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="styles.css" />
+<style>
+  .hub-page { max-width: 1180px; padding-top: 0; padding-bottom: 64px; }
+  .hub-tag {
+    margin-top: 24px;
+    font-size: clamp(20px, 2.2vw, 26px);
+    line-height: 1.35;
+    color: var(--ink-2);
+    letter-spacing: -0.015em;
+    max-width: 580px;
+  }
+  .hub-tag em { font-style: normal; color: var(--ink); }
+  .hub-cta-row { margin-top: 36px; display: flex; gap: 10px; }
+  .hub-cta-row .btn { font-size: 14px; padding: 11px 18px; }
+  .hub-meta-bar {
+    display: flex; gap: 20px; flex-wrap: wrap;
+    margin-top: 40px;
+    font-family: var(--font-mono); font-size: 11.5px;
+    color: var(--muted);
+  }
+  .hub-meta-bar .pip { color: var(--ink); font-weight: 600; font-size: 14px; letter-spacing: -0.02em; }
+  .hub-meta-bar .pip-label { color: var(--muted); font-size: 11px; }
+  .hub-meta-cell { display: flex; flex-direction: column; gap: 2px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+<script type="text/babel" src="pieces.jsx"></script>
+<script type="text/babel" src="shared.jsx"></script>
+
+<script type="text/babel">
+const TOOL_DESC = {
+  play:      'Play a casual game against the bot. Click-to-move, eval bar, top-K candidates, mode picker.',
+  annotate:  'Drop in a PGN — every ply scored against the model. Find your blunders, see the suggested move.',
+  analyze:   'Paste a FEN. Top-10 policy, position V, branch into hypothetical lines, 5-ply PV.',
+  puzzle:    'Feed the bot a tactical puzzle. Watch it find (or miss) the best continuation, batch test pools.',
+  weakness:  'Hand it your lichess username — it pulls your last N games, ranks your mistakes, builds a puzzle file.',
+  lichess:   "Live status of the lichess BOT account: current Elo, games in flight, recent results, accept/decline queue.",
+  discord:   "Add Bottisme to a Discord channel. Configure allow-list, defaults, preview commands in a simulated thread.",
+  daily:     "Curate the daily-puzzle channel. Pick from the mined pool, schedule posts to Telegram & Twitter.",
+  attention: "Inspect what each layer × head is attending to. Useful for interpretability, neat in screenshots.",
+  curve:     "Pit ckpt @ step X against ckpt @ step Y. Watch the bot's strength climb across training.",
+};
+const STATUSES = {
+  play: { label: 'live', tone: 'pos' },
+  annotate: { label: 'beta', tone: 'warn' },
+  analyze: { label: 'beta', tone: 'warn' },
+  lichess: { label: 'online · 1742', tone: 'pos' },
+  discord: { label: 'idle', tone: '' },
+  daily: { label: 'queue: 14', tone: 'warn' },
+  weakness: { label: 'live', tone: 'pos' },
+  puzzle: { label: 'live', tone: 'pos' },
+  attention: { label: 'lab', tone: '' },
+  curve: { label: 'lab', tone: '' },
+};
+
+const SECTIONS = [
+  { key: 'core', title: 'Play', sub: 'face the bot directly' },
+  { key: 'analyse', title: 'Analyse', sub: 'inspect games, positions, weaknesses' },
+  { key: 'deploy', title: 'Deploy', sub: 'where the bot meets the world' },
+  { key: 'research', title: 'Research', sub: 'see how the bot ticks' },
+];
+
+function Hub() {
+  return (
+    <div className="root">
+      <ShellTopbar current="" breadcrumb={null} />
+      <div className="page hub-page">
+        <div className="hub-hero">
+          <div className="brand brand-large"><span className="brand-mark">bottisme</span><span className="brand-dot">.</span></div>
+          <div className="hub-tag">
+            A small <em>chess transformer</em> trained on lichess elite, then on itself.<br/>
+            Ten surfaces to play it, prod it, deploy it.
+          </div>
+          <div className="hub-cta-row">
+            <a href="Bottisme.html" className="btn btn-primary">play a game →</a>
+            <a href="Lichess.html" className="btn">see it on lichess</a>
+          </div>
+          <div className="hub-meta-bar">
+            <div className="hub-meta-cell"><span className="pip">ChessTransformer · 8L · 6H</span><span className="pip-label">model</span></div>
+            <div className="hub-meta-cell"><span className="pip">~1742</span><span className="pip-label">lichess elo</span></div>
+            <div className="hub-meta-cell"><span className="pip">12 ms</span><span className="pip-label">avg inference</span></div>
+            <div className="hub-meta-cell"><span className="pip">8,412</span><span className="pip-label">games played</span></div>
+            <div className="hub-meta-cell"><span className="pip">v0.4</span><span className="pip-label">release</span></div>
+          </div>
+        </div>
+
+        {SECTIONS.map(sec => {
+          const items = TOOLS.filter(t => t.category === sec.key);
+          return (
+            <section className="hub-section" key={sec.key}>
+              <div className="hub-section-head">
+                <div className="hub-section-title">{sec.title}</div>
+                <div className="hub-section-sub">{sec.sub}</div>
+              </div>
+              <div className="hub-grid">
+                {items.map((t, i) => (
+                  <ToolCard
+                    key={t.id}
+                    tool={t}
+                    description={TOOL_DESC[t.id]}
+                    status={STATUSES[t.id]}
+                    accent={sec.key === 'core'}
+                  />
+                ))}
+              </div>
+            </section>
+          );
+        })}
+
+        <div className="page-foot">
+          <span>bottisme · v0.4 · build a1b2c3</span>
+          <span className="dot-sep">·</span>
+          <a href="#">model card</a>
+          <span className="dot-sep">·</span>
+          <a href="#">github</a>
+          <span className="dot-sep">·</span>
+          <a href="#">contact</a>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<Hub />);
+</script>
+</body>
+</html>

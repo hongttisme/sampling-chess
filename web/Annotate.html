@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bottisme · pgn annotator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="styles.css" />
+<style>
+  /* Annotator-specific */
+  .ann-intake {
+    display: grid;
+    grid-template-columns: 1.4fr 1fr;
+    gap: 14px;
+  }
+  .ann-intake .card { display: flex; flex-direction: column; gap: 10px; }
+  .ann-intake .textarea { font-size: 12px; min-height: 160px; }
+  .intake-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin-bottom: 4px; }
+  .intake-tab {
+    background: none; border: none; color: var(--muted);
+    font-family: var(--font-mono); font-size: 12px;
+    padding: 9px 12px; cursor: pointer;
+    border-bottom: 2px solid transparent; margin-bottom: -1px;
+  }
+  .intake-tab.active { color: var(--ink); border-bottom-color: var(--accent); }
+  .as-row { display: flex; gap: 6px; }
+  .as-pill {
+    flex: 1; padding: 9px 12px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: var(--radius); font-family: var(--font-mono); font-size: 12px;
+    cursor: pointer; text-align: center; color: var(--ink-2);
+  }
+  .as-pill.on { border-color: var(--ink); color: var(--ink); background: var(--raised); box-shadow: inset 0 0 0 1px var(--ink); }
+  .sample-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .sample-btn {
+    background: var(--bg-2); border: 1px solid var(--border);
+    padding: 6px 10px; border-radius: 4px;
+    font-family: var(--font-mono); font-size: 11px; color: var(--ink-2);
+    cursor: pointer;
+  }
+  .sample-btn:hover { color: var(--ink); border-color: var(--border-strong); }
+
+  /* Analysis layout */
+  .ann-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 380px;
+    gap: 24px;
+    align-items: start;
+  }
+  .ann-board-wrap {
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+  }
+  .ann-board { width: min(560px, 90vw); }
+  .scrubber {
+    width: 100%;
+    background: var(--raised); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 10px 14px;
+    display: flex; gap: 6px; align-items: center;
+    font-family: var(--font-mono); font-size: 12px;
+  }
+  .scrub-btn {
+    background: var(--bg-2); border: 1px solid var(--border);
+    color: var(--ink); width: 32px; height: 30px;
+    border-radius: 4px; cursor: pointer; font-family: var(--font-mono); font-size: 13px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .scrub-btn:hover { background: var(--bg); border-color: var(--border-strong); }
+  .scrub-pos {
+    flex: 1; text-align: center;
+    color: var(--muted);
+  }
+  .scrub-track {
+    position: relative; height: 14px;
+    background: var(--bg-2); border-radius: 7px;
+    margin: 4px 8px; cursor: pointer;
+    overflow: hidden;
+  }
+  .scrub-fill {
+    position: absolute; top: 0; left: 0; height: 100%;
+    background: var(--accent-soft);
+  }
+  .scrub-mistake {
+    position: absolute; top: 1px; bottom: 1px; width: 2px;
+    background: var(--neg);
+  }
+  .scrub-blunder {
+    position: absolute; top: 1px; bottom: 1px; width: 3px;
+    background: var(--neg); box-shadow: 0 0 0 1px var(--neg-soft);
+  }
+  .scrub-handle {
+    position: absolute; top: 0; bottom: 0; width: 4px;
+    background: var(--ink); border-radius: 2px;
+    transform: translateX(-50%);
+  }
+
+  /* Ply analysis card */
+  .ply-card { padding: 18px; }
+  .ply-card .move-grid {
+    display: grid; grid-template-columns: 100px 1fr 60px;
+    gap: 8px 12px; align-items: center;
+    font-family: var(--font-mono);
+  }
+  .ply-card .move-label {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted);
+  }
+  .ply-card .move-san { font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
+  .ply-card .move-san.is-your { color: var(--ink); }
+  .ply-card .move-san.is-bot { color: var(--accent); }
+  .ply-card .move-v { font-size: 13px; font-weight: 600; text-align: right; }
+  .ply-card .move-v.pos { color: var(--pos); }
+  .ply-card .move-v.neg { color: var(--neg); }
+  .verdict-row {
+    display: flex; align-items: center; gap: 8px;
+    padding-top: 14px; margin-top: 14px;
+    border-top: 1px solid var(--border);
+  }
+  .verdict-row .verdict {
+    font-family: var(--font-mono); font-size: 13px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  .verdict-row .verdict.best { color: var(--pos); }
+  .verdict-row .verdict.ok { color: var(--ink-2); }
+  .verdict-row .verdict.inacc { color: var(--warn); }
+  .verdict-row .verdict.mist { color: var(--neg); }
+  .verdict-row .verdict.blund { color: var(--neg); font-weight: 700; }
+  .verdict-row .delta {
+    margin-left: auto; font-family: var(--font-mono); font-size: 12px; color: var(--muted);
+  }
+
+  /* Stats grid */
+  .stat-grid {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 16px 24px;
+    padding: 18px;
+  }
+  .acc-meter {
+    height: 6px; background: var(--bg-2); border-radius: 3px; overflow: hidden;
+    margin-top: 8px;
+  }
+  .acc-meter-fill { height: 100%; background: var(--pos); }
+
+  /* Move list with annotations */
+  .ann-moves {
+    max-height: 320px; overflow-y: auto;
+    font-family: var(--font-mono); font-size: 12.5px;
+    padding: 6px 0;
+  }
+  .ann-mlrow {
+    display: grid; grid-template-columns: 28px 1fr 1fr;
+    gap: 8px; padding: 5px 14px;
+    align-items: center;
+  }
+  .ann-mlrow:hover { background: var(--bg-2); }
+  .ann-mlrow.is-current { background: var(--accent-soft); }
+  .ann-mlcell {
+    display: inline-flex; align-items: center; gap: 4px;
+    cursor: pointer; padding: 2px 4px; border-radius: 3px;
+  }
+  .ann-mlcell .marker {
+    font-size: 11px; font-weight: 700;
+  }
+  .ann-mlcell .marker.inacc { color: var(--warn); }
+  .ann-mlcell .marker.mist { color: var(--neg); }
+  .ann-mlcell .marker.blund { color: var(--neg); }
+
+  /* Top-K alternatives */
+  .alt-row {
+    display: grid; grid-template-columns: 22px 60px 1fr 50px;
+    gap: 10px; align-items: center;
+    padding: 6px 14px;
+    font-family: var(--font-mono); font-size: 12px;
+  }
+  .alt-row .alt-rank { color: var(--muted); font-size: 10.5px; }
+  .alt-row .alt-san { color: var(--ink); font-weight: 500; }
+  .alt-row .alt-v { text-align: right; font-weight: 600; }
+  .alt-row.is-played { background: var(--accent-soft); }
+  .alt-row.is-best .alt-san { color: var(--pos); font-weight: 600; }
+
+  /* V trajectory chart at top of analysis */
+  .v-trajectory {
+    background: var(--raised); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 14px 16px;
+    margin-bottom: 16px;
+  }
+  .v-trajectory svg { display: block; width: 100%; height: 80px; }
+  .v-traj-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    margin-bottom: 6px;
+  }
+  .v-traj-title {
+    font-family: var(--font-mono); font-size: 10.5px;
+    text-transform: uppercase; letter-spacing: 0.1em; color: var(--ink);
+  }
+  .v-traj-jump {
+    font-family: var(--font-mono); font-size: 11px;
+    color: var(--accent); cursor: pointer; background: none; border: none;
+    padding: 0;
+  }
+  .v-traj-jump:hover { text-decoration: underline; }
+
+  @media (max-width: 1000px) {
+    .ann-layout { grid-template-columns: 1fr; }
+    .ann-intake { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+<script type="text/babel" src="pieces.jsx"></script>
+<script type="text/babel" src="shared.jsx"></script>
+
+<script type="text/babel" src="annotate.jsx"></script>
+</body>
+</html>

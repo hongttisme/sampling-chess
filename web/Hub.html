@@ -44,35 +44,19 @@
 
 <script type="text/babel">
 const TOOL_DESC = {
-  play:      'Play a casual game against the bot. Click-to-move, eval bar, top-K candidates, mode picker.',
+  play:      'Play a casual game against the bot. Click-to-move, eval bar, top-K candidates, sim-depth picker.',
   annotate:  'Drop in a PGN — every ply scored against the model. Find your blunders, see the suggested move.',
   analyze:   'Paste a FEN. Top-10 policy, position V, branch into hypothetical lines, 5-ply PV.',
-  puzzle:    'Feed the bot a tactical puzzle. Watch it find (or miss) the best continuation, batch test pools.',
-  weakness:  'Hand it your lichess username — it pulls your last N games, ranks your mistakes, builds a puzzle file.',
-  lichess:   "Live status of the lichess BOT account: current Elo, games in flight, recent results, accept/decline queue.",
-  discord:   "Add Bottisme to a Discord channel. Configure allow-list, defaults, preview commands in a simulated thread.",
-  daily:     "Curate the daily-puzzle channel. Pick from the mined pool, schedule posts to Telegram & Twitter.",
-  attention: "Inspect what each layer × head is attending to. Useful for interpretability, neat in screenshots.",
-  curve:     "Pit ckpt @ step X against ckpt @ step Y. Watch the bot's strength climb across training.",
 };
 const STATUSES = {
-  play: { label: 'live', tone: 'pos' },
-  annotate: { label: 'beta', tone: 'warn' },
-  analyze: { label: 'beta', tone: 'warn' },
-  lichess: { label: 'online · 1742', tone: 'pos' },
-  discord: { label: 'idle', tone: '' },
-  daily: { label: 'queue: 14', tone: 'warn' },
-  weakness: { label: 'live', tone: 'pos' },
-  puzzle: { label: 'live', tone: 'pos' },
-  attention: { label: 'lab', tone: '' },
-  curve: { label: 'lab', tone: '' },
+  play:     { label: 'live', tone: 'pos' },
+  annotate: { label: 'live', tone: 'pos' },
+  analyze:  { label: 'live', tone: 'pos' },
 };
 
 const SECTIONS = [
-  { key: 'core', title: 'Play', sub: 'face the bot directly' },
-  { key: 'analyse', title: 'Analyse', sub: 'inspect games, positions, weaknesses' },
-  { key: 'deploy', title: 'Deploy', sub: 'where the bot meets the world' },
-  { key: 'research', title: 'Research', sub: 'see how the bot ticks' },
+  { key: 'core',    title: 'Play',    sub: 'face the bot directly' },
+  { key: 'analyse', title: 'Analyse', sub: 'inspect games + positions' },
 ];
 
 function Hub() {
@@ -83,12 +67,12 @@ function Hub() {
         <div className="hub-hero">
           <div className="brand brand-large"><span className="brand-mark">bottisme</span><span className="brand-dot">.</span></div>
           <div className="hub-tag">
-            A small <em>chess transformer</em> trained on lichess elite, then on itself.<br/>
-            Ten surfaces to play it, prod it, deploy it.
+            A small <em>chess transformer</em> trained on lichess elite.<br/>
+            Three surfaces to play it and prod it.
           </div>
           <div className="hub-cta-row">
             <a href="Bottisme.html" className="btn btn-primary">play a game →</a>
-            <a href="Lichess.html" className="btn">see it on lichess</a>
+            <a href="Analyze.html" className="btn">analyze a position</a>
           </div>
           <div className="hub-meta-bar">
             <div className="hub-meta-cell"><span className="pip">ChessTransformer · 8L · 6H</span><span className="pip-label">model</span></div>

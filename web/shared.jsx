@@ -8,13 +8,6 @@ const TOOLS = [
   { id: 'play',      label: 'Play',                file: 'Bottisme.html',  category: 'core' },
   { id: 'annotate',  label: 'PGN Annotator',       file: 'Annotate.html',  category: 'analyse' },
   { id: 'analyze',   label: 'Position Analyzer',   file: 'Analyze.html',   category: 'analyse' },
-  { id: 'puzzle',    label: 'Puzzle Solver',       file: 'Puzzle.html',    category: 'analyse' },
-  { id: 'weakness',  label: 'Weakness Detector',   file: 'Weakness.html',  category: 'analyse' },
-  { id: 'lichess',   label: 'Lichess BOT',         file: 'Lichess.html',   category: 'deploy' },
-  { id: 'discord',   label: 'Discord Bot',         file: 'Discord.html',   category: 'deploy' },
-  { id: 'daily',     label: 'Daily Puzzle',        file: 'Daily.html',     category: 'deploy' },
-  { id: 'attention', label: 'Attention Viewer',    file: 'Attention.html', category: 'research' },
-  { id: 'curve',     label: 'Training Replay',     file: 'Curve.html',     category: 'research' },
 ];
 
 function ShellTopbar({ current, breadcrumb }) {
